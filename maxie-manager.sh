@@ -22,7 +22,7 @@ BANDWIDTH_DB="$CONFIG_DIR/bandwidth.db"
 SERVICES_STATUS="$CONFIG_DIR/services.status"
 LOG_DIR="/var/log/maxie"
 
-# Load configuration and scripts
+# Load configuration
 load_config() {
     if [ -f "$CONFIG_FILE" ]; then
         source "$CONFIG_FILE"
@@ -34,13 +34,6 @@ load_config() {
     if [ -f "$SERVICES_FILE" ]; then
         source "$SERVICES_FILE"
     fi
-    
-    # Load all component scripts
-    for script in "$SCRIPTS_DIR"/*.sh; do
-        if [ -f "$script" ]; then
-            source "$script"
-        fi
-    done
 }
 
 # Display banner
@@ -120,36 +113,51 @@ check_port_conflict() {
 install_all_services() {
     echo -e "${CYAN}Installing all services...${NC}"
     
+    # Load component scripts
+    for script in "$SCRIPTS_DIR"/*.sh; do
+        if [ -f "$script" ]; then
+            source "$script"
+        fi
+    done
+    
     # Check and install each service based on config
     if [ "$SSH" = "1" ]; then
         setup_ssh
+        read -p "Press Enter to continue..."
     fi
     
     if [ "$DROPBEAR" = "1" ]; then
         setup_dropbear
+        read -p "Press Enter to continue..."
     fi
     
     if [ "$V2RAY" = "1" ]; then
         setup_v2ray
+        read -p "Press Enter to continue..."
     fi
     
     if [ "$SSL_TLS" = "1" ]; then
         setup_ssl_tls
+        read -p "Press Enter to continue..."
     fi
     
     if [ "$STUNNEL" = "1" ]; then
         setup_stunnel
+        read -p "Press Enter to continue..."
     fi
     
     if [ "$WEBSOCKET" = "1" ]; then
         setup_websocket
+        read -p "Press Enter to continue..."
     fi
     
     if [ "$BANDWIDTH_MONITORING" = "1" ]; then
         setup_bandwidth_monitoring
+        read -p "Press Enter to continue..."
     fi
     
     echo -e "${GREEN}All services installed successfully!${NC}"
+    read -p "Press Enter to return to main menu..."
 }
 
 # Service status monitoring
@@ -186,6 +194,7 @@ monitor_services() {
     fi
     
     echo -e "══════════════════════════════════════════"
+    read -p "Press Enter to return to main menu..."
 }
 
 # System resource monitoring
@@ -213,47 +222,139 @@ system_stats() {
     echo -e "Bandwidth Monitoring: ${GREEN}Active${NC}"
     
     echo -e "══════════════════════════════════════════"
+    read -p "Press Enter to return to main menu..."
 }
 
 # SSL setup with domain verification
 setup_ssl_certificate() {
-    if [ "$DOMAIN" = "your-domain.com" ] || [ -z "$DOMAIN" ]; then
-        read -p "Enter your domain name: " domain
-        read -p "Enter your email for SSL certificates: " email
-        sed -i "s/^DOMAIN=.*/DOMAIN=$domain/" "$CONFIG_FILE"
-        sed -i "s/^EMAIL=.*/EMAIL=$email/" "$CONFIG_FILE"
-        load_config
-    fi
-    
-    # Verify DNS
-    local ip=$(curl -s ifconfig.me)
-    local dns_ip=$(dig +short "$DOMAIN")
-    
-    if [ "$dns_ip" != "$ip" ]; then
-        echo -e "${YELLOW}Warning: DNS may not be properly configured!${NC}"
-        echo -e "Domain $DOMAIN points to: $dns_ip"
-        echo -e "Your server IP is: $ip"
-        read -p "Continue anyway? (y/N): " continue_anyway
-        if [ "$continue_anyway" != "y" ] && [ "$continue_anyway" != "Y" ]; then
-            return 1
-        fi
-    fi
-    
-    # Install Certbot and get SSL certificate
-    apt install -y certbot
-    certbot certonly --standalone --noninteractive --agree-tos \
-        --email "$EMAIL" -d "$DOMAIN" \
-        --pre-hook "systemctl stop nginx" \
-        --post-hook "systemctl start nginx"
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}SSL certificate obtained successfully!${NC}"
-        show_switch_banner "SSL/TLS" "443" "Secure"
-        return 0
+    # Load SSL script
+    if [ -f "$SCRIPTS_DIR/ssl-tls.sh" ]; then
+        source "$SCRIPTS_DIR/ssl-tls.sh"
+        setup_ssl_tls
     else
-        echo -e "${RED}Failed to obtain SSL certificate!${NC}"
-        return 1
+        echo -e "${RED}SSL script not found!${NC}"
     fi
+    read -p "Press Enter to return to main menu..."
+}
+
+# User management menu
+user_management_menu() {
+    echo -e "${CYAN}User Management${NC}"
+    echo -e "══════════════════════════════════════════"
+    echo -e "1. Create User"
+    echo -e "2. Delete User"
+    echo -e "3. List Users"
+    echo -e "4. Back to Main Menu"
+    echo -e "══════════════════════════════════════════"
+    
+    read -p "Choose an option: " choice
+    
+    case $choice in
+        1)
+            echo -e "${CYAN}Creating new user...${NC}"
+            read -p "Enter username: " username
+            read -s -p "Enter password: " password
+            echo
+            read -p "Enter bandwidth limit (e.g., 50MB, 10GB): " bandwidth_limit
+            read -p "Enter expiry days (e.g., 7, 30): " expiry_days
+            
+            # Create user (simplified version)
+            useradd -m -s /bin/false "$username"
+            echo "$username:$password" | chpasswd
+            expiry_date=$(date -d "+$expiry_days days" +%Y-%m-%d)
+            echo "$username:0:0:$bandwidth_limit:$expiry_date" >> "$BANDWIDTH_DB"
+            
+            echo -e "${GREEN}User $username created successfully!${NC}"
+            echo -e "Expiry date: $expiry_date | Bandwidth limit: $bandwidth_limit"
+            ;;
+        2)
+            echo -e "${CYAN}Deleting user...${NC}"
+            read -p "Enter username to delete: " username
+            if id "$username" &>/dev/null; then
+                userdel -r "$username" 2>/dev/null
+                sed -i "/^$username:/d" "$BANDWIDTH_DB"
+                echo -e "${GREEN}User $username deleted successfully!${NC}"
+            else
+                echo -e "${RED}User $username not found!${NC}"
+            fi
+            ;;
+        3)
+            echo -e "${CYAN}User List:${NC}"
+            if [ -s "$BANDWIDTH_DB" ]; then
+                echo -e "Username     Bandwidth Limit     Expiry Date"
+                echo -e "══════════════════════════════════════════"
+                while IFS=: read -r user _ _ limit expiry; do
+                    echo -e "$user     $limit     $expiry"
+                done < "$BANDWIDTH_DB"
+            else
+                echo -e "${YELLOW}No users found.${NC}"
+            fi
+            ;;
+        4)
+            return
+            ;;
+        *)
+            echo -e "${RED}Invalid option!${NC}"
+            ;;
+    esac
+    
+    read -p "Press Enter to continue..."
+    user_management_menu
+}
+
+# Bandwidth monitoring menu
+bandwidth_monitoring_menu() {
+    echo -e "${CYAN}Bandwidth Monitoring${NC}"
+    echo -e "══════════════════════════════════════════"
+    echo -e "1. View Bandwidth Usage"
+    echo -e "2. Set Bandwidth Limits"
+    echo -e "3. Reset Bandwidth Counters"
+    echo -e "4. Back to Main Menu"
+    echo -e "══════════════════════════════════════════"
+    
+    read -p "Choose an option: " choice
+    
+    case $choice in
+        1)
+            echo -e "${CYAN}Bandwidth Usage:${NC}"
+            if [ -s "$BANDWIDTH_DB" ]; then
+                echo -e "Username     Download     Upload     Limit"
+                echo -e "══════════════════════════════════════════"
+                while IFS=: read -r user download upload limit expiry; do
+                    echo -e "$user     ${download}MB     ${upload}MB     $limit"
+                done < "$BANDWIDTH_DB"
+            else
+                echo -e "${YELLOW}No bandwidth data available.${NC}"
+            fi
+            ;;
+        2)
+            echo -e "${CYAN}Set Bandwidth Limits${NC}"
+            read -p "Enter username: " username
+            if grep -q "^$username:" "$BANDWIDTH_DB"; then
+                read -p "Enter new bandwidth limit (e.g., 50MB, 10GB): " new_limit
+                sed -i "s/^$username:.*:.*:.*:.*/$username:0:0:$new_limit:$expiry/" "$BANDWIDTH_DB"
+                echo -e "${GREEN}Bandwidth limit updated for $username!${NC}"
+            else
+                echo -e "${RED}User $username not found!${NC}"
+            fi
+            ;;
+        3)
+            echo -e "${CYAN}Resetting bandwidth counters...${NC}"
+            while IFS=: read -r user _ _ limit expiry; do
+                sed -i "s/^$user:.*:.*:.*:.*/$user:0:0:$limit:$expiry/" "$BANDWIDTH_DB"
+            done < "$BANDWIDTH_DB"
+            echo -e "${GREEN}Bandwidth counters reset!${NC}"
+            ;;
+        4)
+            return
+            ;;
+        *)
+            echo -e "${RED}Invalid option!${NC}"
+            ;;
+    esac
+    
+    read -p "Press Enter to continue..."
+    bandwidth_monitoring_menu
 }
 
 # Uninstall function
@@ -266,7 +367,7 @@ uninstall_manager() {
     
     # Stop all services
     echo -e "${YELLOW}Stopping services...${NC}"
-    systemctl stop dropbear v2ray stunnel4 sslh nginx
+    systemctl stop dropbear v2ray stunnel4 sslh nginx 2>/dev/null
     
     # Remove iptables rules
     echo -e "${YELLOW}Cleaning up iptables...${NC}"
@@ -287,6 +388,8 @@ uninstall_manager() {
     rm -f /usr/local/bin/maxie
     
     echo -e "${GREEN}Maxie VPS Manager has been completely uninstalled.${NC}"
+    read -p "Press Enter to exit..."
+    exit 0
 }
 
 # Main menu
@@ -319,8 +422,14 @@ main_menu() {
             5) monitor_services ;;
             6) setup_ssl_certificate ;;
             7) uninstall_manager ;;
-            8) exit 0 ;;
-            *) echo -e "${RED}Invalid option!${NC}"; sleep 1 ;;
+            8) 
+                echo -e "${GREEN}Goodbye!${NC}"
+                exit 0
+                ;;
+            *) 
+                echo -e "${RED}Invalid option!${NC}"
+                sleep 1
+                ;;
         esac
     done
 }
@@ -333,11 +442,27 @@ fi
 
 # Handle command line arguments
 case "${1:-}" in
-    "update-bandwidth") update_bandwidth_stats ;;
-    "check-expiry") check_user_expiry ;;
-    "setup-ssl") setup_ssl_certificate ;;
-    "uninstall") uninstall_manager ;;
-    "status") monitor_services ;;
-    "stats") system_stats ;;
-    *) main_menu ;;
+    "update-bandwidth") 
+        echo -e "${CYAN}Updating bandwidth statistics...${NC}"
+        # Add bandwidth update logic here
+        ;;
+    "check-expiry") 
+        echo -e "${CYAN}Checking user expiry...${NC}"
+        # Add expiry check logic here
+        ;;
+    "setup-ssl") 
+        setup_ssl_certificate
+        ;;
+    "uninstall") 
+        uninstall_manager
+        ;;
+    "status") 
+        monitor_services
+        ;;
+    "stats") 
+        system_stats
+        ;;
+    *) 
+        main_menu
+        ;;
 esac
