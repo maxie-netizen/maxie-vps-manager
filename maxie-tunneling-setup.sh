@@ -102,7 +102,6 @@ check_system() {
 update_system() {
     print_status "Updating system packages..."
     apt update -y >> "$LOG_FILE" 2>&1
-    apt upgrade -y >> "$LOG_FILE" 2>&1
     apt install -y curl wget git ufw >> "$LOG_FILE" 2>&1
     print_status "System updated successfully"
 }
