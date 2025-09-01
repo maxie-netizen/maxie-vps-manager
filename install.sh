@@ -483,7 +483,7 @@ check_services() {
     echo -e "${GREEN}=== Service Status ===${NC}"
     echo
     
-    services=("badvpn" "udp-custom" "stunnel4" "websocket-proxy" "3proxy" "dnstt" "sslh" "nginx" "x-ui")
+    services=("badvpn" "udp-custom" "stunnel4" "websocket-proxy" "3proxy" "dnstt" "sslh" "nginx")
     
     for service in "${services[@]}"; do
         if systemctl is-active --quiet "$service" 2>/dev/null; then
@@ -515,19 +515,19 @@ manage_services() {
         case $choice in
             1)
                 echo "Starting all services..."
-                systemctl start badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx x-ui 2>/dev/null || true
+                systemctl start badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx 2>/dev/null || true
                 ;;
             2)
                 echo "Stopping all services..."
-                systemctl stop badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx x-ui 2>/dev/null || true
+                systemctl stop badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx 2>/dev/null || true
                 ;;
             3)
                 echo "Restarting all services..."
-                systemctl restart badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx x-ui 2>/dev/null || true
+                systemctl restart badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx 2>/dev/null || true
                 ;;
             4)
                 echo "Enabling all services..."
-                systemctl enable badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx x-ui 2>/dev/null || true
+                systemctl enable badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx 2>/dev/null || true
                 ;;
             5)
                 break
@@ -683,8 +683,8 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "Removing Maxie VPS Manager..."
     
     # Stop and disable services
-    systemctl stop badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx x-ui 2>/dev/null || true
-    systemctl disable badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx x-ui 2>/dev/null || true
+    systemctl stop badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx 2>/dev/null || true
+    systemctl disable badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx 2>/dev/null || true
     
     # Remove systemd services
     rm -f /etc/systemd/system/badvpn.service
@@ -729,12 +729,12 @@ echo "=== Next Steps ==="
 echo "1. Run: maxie-vps-manager"
 echo "2. Choose option 1 to install all tunneling protocols"
 echo "3. Configure your domain and SSL certificates"
-echo "4. Access X-UI Panel at http://your-ip:54321"
+echo "4. Configure your tunneling clients with the provided connection information"
 echo
 echo "=== Important Notes ==="
 echo "- All services will start automatically on boot"
 echo "- Firewall rules will be configured automatically"
 echo "- SSL certificates will auto-renew every 90 days"
-echo "- Default X-UI credentials: admin/admin (change immediately!)"
+echo "- All tunneling protocols run as systemd services for automatic startup"
 echo
 echo "Installation completed at: $(date)"
