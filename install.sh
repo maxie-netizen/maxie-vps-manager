@@ -74,7 +74,9 @@ chmod +x "$INSTALL_DIR/maxie-tunneling-setup.sh"
 
 # Create the main manager script
 print_status "Creating main manager script..."
-cat > /usr/local/bin/maxie-vps-manager << 'EOF'
+
+# Create the script content in a temporary file first
+cat > /tmp/maxie-vps-manager-temp.sh << 'EOF'
 #!/bin/bash
 
 # Maxie VPS Manager - Main Interface
@@ -246,19 +248,25 @@ install_badvpn() {
     local port=$1
     apt update
     apt install -y badvpn
-    cat > /etc/systemd/system/badvpn.service << EOF
+    
+    # Create systemd service file
+    cat > /etc/systemd/system/badvpn.service << 'BADVPN_EOF'
 [Unit]
 Description=BadVPN UDP Gateway
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/badvpn-udpgw --listen-addr 0.0.0.0:$port
+ExecStart=/usr/bin/badvpn-udpgw --listen-addr 0.0.0.0:PORT_PLACEHOLDER
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
-EOF
+BADVPN_EOF
+    
+    # Replace port placeholder
+    sed -i "s/PORT_PLACEHOLDER/$port/g" /etc/systemd/system/badvpn.service
+    
     systemctl daemon-reload
     systemctl enable badvpn
     systemctl start badvpn
@@ -616,6 +624,9 @@ while true; do
     esac
 done
 EOF
+
+# Move the temporary file to the final location
+mv /tmp/maxie-vps-manager-temp.sh /usr/local/bin/maxie-vps-manager
 
 # Make the manager script executable
 chmod +x /usr/local/bin/maxie-vps-manager
