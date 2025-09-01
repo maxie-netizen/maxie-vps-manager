@@ -103,7 +103,7 @@ update_system() {
     print_status "Updating system packages..."
     apt update -y >> "$LOG_FILE" 2>&1
     apt install -y curl wget git ufw >> "$LOG_FILE" 2>&1
-    print_status "System updated successfully"
+    print_status "System updated successfully (upgrade skipped to avoid VM slowdown)"
 }
 
 # Function to configure firewall
