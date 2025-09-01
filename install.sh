@@ -236,9 +236,9 @@ Restart=always
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable badvpn
-    systemctl start badvpn
+    systemctl daemon-reload-udpgw
+    systemctl enable badvpn-udpgw
+    systemctl start badvpn-udpgw
 }
 
 install_udp_custom() {
@@ -703,3 +703,4 @@ echo "- SSL certificates will auto-renew every 90 days"
 echo "- Default X-UI credentials: admin/admin (change immediately!)"
 echo
 echo "Installation completed at: $(date)"
+
