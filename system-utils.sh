@@ -292,7 +292,7 @@ cleanup_old_backups() {
 update_system() {
     print_status "Updating system packages..."
     
-    # Update package list
+    # Update package list only (no upgrade to avoid VM slowdown)
     apt update
     
     if [[ $? -eq 0 ]]; then
@@ -300,15 +300,10 @@ update_system() {
         local updates=$(apt list --upgradable 2>/dev/null | grep -v "WARNING" | wc -l)
         
         if [[ $updates -gt 0 ]]; then
-            print_status "Found $updates available updates. Installing..."
-            apt upgrade -y
-            
-            if [[ $? -eq 0 ]]; then
-                print_status "System update completed successfully"
-            else
-                print_error "System update failed"
-                return 1
-            fi
+            print_status "Found $updates available updates"
+            print_warning "⚠️  Full system upgrade skipped to avoid VM slowdown"
+            echo "To upgrade specific packages, use: apt install --only-upgrade <package-name>"
+            echo "To upgrade all packages manually, use: apt upgrade -y"
         else
             print_status "System is already up to date"
         fi
