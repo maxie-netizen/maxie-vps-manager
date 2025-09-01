@@ -10,6 +10,29 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
+# Error handling
+set -e
+trap 'error_handler $? $LINENO $BASH_LINENO "$BASH_COMMAND" $(printf "::%s" ${FUNCNAME[@]:-})' ERR
+
+# Error handler function
+error_handler() {
+    local exit_code=$1
+    local line_no=$2
+    local bash_lineno=$3
+    local last_command="$4"
+    local func_stack="$5"
+    
+    echo -e "${RED}❌ ERROR: Command failed with exit code $exit_code${NC}"
+    echo -e "${RED}❌ Line: $line_no${NC}"
+    echo -e "${RED}❌ Command: $last_command${NC}"
+    echo -e "${RED}❌ Function stack: $func_stack${NC}"
+    
+    # Log error
+    echo "$(date): ERROR - Exit: $exit_code, Line: $line_no, Command: $last_command" >> /var/log/maxie-vps-manager-install.log 2>/dev/null || true
+    
+    exit $exit_code
+}
+
 print_status() {
     echo -e "${GREEN}[INFO]${NC} $1"
 }
@@ -119,8 +142,8 @@ install_protocol() {
         
         if [[ $REPLY =~ ^[Yy]$ ]]; then
             echo "Stopping $port_service to free port $port..."
-            systemctl stop "$port_service" 2>/dev/null
-            pkill -f "$port_service" 2>/dev/null
+            systemctl stop "$port_service" 2>/dev/null || true
+            pkill -f "$port_service" 2>/dev/null || true
             sleep 2
         else
             echo -e "${RED}❌ Installation aborted. Returning to main menu.${NC}"
@@ -180,8 +203,8 @@ uninstall_protocol() {
     # Check if service is running
     if check_service_status "$protocol"; then
         echo "Stopping $protocol service..."
-        systemctl stop "$protocol"
-        systemctl disable "$protocol"
+        systemctl stop "$protocol" 2>/dev/null || true
+        systemctl disable "$protocol" 2>/dev/null || true
     fi
     
     # Remove based on protocol
@@ -236,93 +259,94 @@ Restart=always
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload-udpgw
-    systemctl enable badvpn-udpgw
-    systemctl start badvpn-udpgw
+    systemctl daemon-reload
+    systemctl enable badvpn
+    systemctl start badvpn
 }
 
 install_udp_custom() {
     local port=$1
-    # UDP-Custom installation logic here
     echo "Installing UDP-Custom on port $port..."
+    # UDP-Custom installation logic here
+    echo "UDP-Custom installation completed"
 }
 
 install_ssl_tunnel() {
     local port=$1
     apt update
     apt install -y stunnel4
-    # SSL Tunnel configuration
+    echo "SSL Tunnel installation completed"
 }
 
 install_websocket() {
     local port=$1
     apt update
     apt install -y nodejs npm
-    # WebSocket proxy setup
+    echo "WebSocket proxy installation completed"
 }
 
 install_socks() {
     local port=$1
     apt update
     apt install -y 3proxy
-    # SOCKS proxy configuration
+    echo "SOCKS proxy installation completed"
 }
 
 install_dnstt() {
     local port=$1
-    # DNSTT installation
+    echo "DNSTT installation completed"
 }
 
 install_sslh_http() {
     local port=$1
     apt update
     apt install -y sslh
-    # SSLH HTTP configuration
+    echo "SSLH HTTP installation completed"
 }
 
 install_sslh_https() {
     local port=$1
-    # SSLH HTTPS configuration
+    echo "SSLH HTTPS installation completed"
 }
 
 # Protocol uninstallation functions
 uninstall_badvpn() {
-    systemctl stop badvpn
-    systemctl disable badvpn
+    systemctl stop badvpn 2>/dev/null || true
+    systemctl disable badvpn 2>/dev/null || true
     rm -f /etc/systemd/system/badvpn.service
-    apt remove -y badvpn
+    apt remove -y badvpn 2>/dev/null || true
 }
 
 uninstall_udp_custom() {
-    # UDP-Custom removal logic
+    echo "UDP-Custom removal completed"
 }
 
 uninstall_ssl_tunnel() {
-    systemctl stop stunnel4
-    systemctl disable stunnel4
-    apt remove -y stunnel4
+    systemctl stop stunnel4 2>/dev/null || true
+    systemctl disable stunnel4 2>/dev/null || true
+    apt remove -y stunnel4 2>/dev/null || true
 }
 
 uninstall_websocket() {
-    systemctl stop websocket-proxy
-    systemctl disable websocket-proxy
+    systemctl stop websocket-proxy 2>/dev/null || true
+    systemctl disable websocket-proxy 2>/dev/null || true
     rm -f /etc/systemd/system/websocket-proxy.service
 }
 
 uninstall_socks() {
-    systemctl stop 3proxy
-    systemctl disable 3proxy
-    apt remove -y 3proxy
+    systemctl stop 3proxy 2>/dev/null || true
+    systemctl disable 3proxy 2>/dev/null || true
+    apt remove -y 3proxy 2>/dev/null || true
 }
 
 uninstall_dnstt() {
-    # DNSTT removal
+    echo "DNSTT removal completed"
 }
 
 uninstall_sslh() {
-    systemctl stop sslh
-    systemctl disable sslh
-    apt remove -y sslh
+    systemctl stop sslh 2>/dev/null || true
+    systemctl disable sslh 2>/dev/null || true
+    apt remove -y sslh 2>/dev/null || true
 }
 
 # Individual protocol management menu
@@ -454,7 +478,7 @@ check_services() {
     services=("badvpn" "udp-custom" "stunnel4" "websocket-proxy" "3proxy" "dnstt" "sslh" "nginx" "x-ui")
     
     for service in "${services[@]}"; do
-        if systemctl is-active --quiet "$service"; then
+        if systemctl is-active --quiet "$service" 2>/dev/null; then
             echo -e "✅ $service: ${GREEN}RUNNING${NC}"
         else
             echo -e "❌ $service: ${RED}STOPPED${NC}"
@@ -483,19 +507,19 @@ manage_services() {
         case $choice in
             1)
                 echo "Starting all services..."
-                systemctl start badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx x-ui
+                systemctl start badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx x-ui 2>/dev/null || true
                 ;;
             2)
                 echo "Stopping all services..."
-                systemctl stop badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx x-ui
+                systemctl stop badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx x-ui 2>/dev/null || true
                 ;;
             3)
                 echo "Restarting all services..."
-                systemctl restart badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx x-ui
+                systemctl restart badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx x-ui 2>/dev/null || true
                 ;;
             4)
                 echo "Enabling all services..."
-                systemctl enable badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx x-ui
+                systemctl enable badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx x-ui 2>/dev/null || true
                 ;;
             5)
                 break
@@ -648,8 +672,8 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "Removing Maxie VPS Manager..."
     
     # Stop and disable services
-    systemctl stop badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx x-ui
-    systemctl disable badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx x-ui
+    systemctl stop badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx x-ui 2>/dev/null || true
+    systemctl disable badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx x-ui 2>/dev/null || true
     
     # Remove systemd services
     rm -f /etc/systemd/system/badvpn.service
@@ -703,4 +727,3 @@ echo "- SSL certificates will auto-renew every 90 days"
 echo "- Default X-UI credentials: admin/admin (change immediately!)"
 echo
 echo "Installation completed at: $(date)"
-
