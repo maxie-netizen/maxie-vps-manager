@@ -132,8 +132,12 @@ configure_firewall() {
         ufw allow $WEBSOCKET_PORT/tcp >> "$LOG_FILE" 2>&1
         ufw allow $SOCKS_PORT/tcp >> "$LOG_FILE" 2>&1
         ufw allow $DNSTT_PORT/udp >> "$LOG_FILE" 2>&1
-        ufw allow $SSLH_PORT_HTTP/tcp >> "$LOG_FILE" 2>&1
-        ufw allow $SSLH_PORT_HTTPS/tcp >> "$LOG_FILE" 2>&1
+        # Allow nginx on standard ports
+        ufw allow 80/tcp >> "$LOG_FILE" 2>&1
+        ufw allow 443/tcp >> "$LOG_FILE" 2>&1
+        # Allow SSLH on alternative ports to avoid conflicts
+        ufw allow 8443/tcp >> "$LOG_FILE" 2>&1
+        ufw allow 8081/tcp >> "$LOG_FILE" 2>&1
         
         # Enable UFW
         ufw --force enable >> "$LOG_FILE" 2>&1
@@ -142,7 +146,7 @@ configure_firewall() {
     fi
 }
 
-# Function to check SSL certificates
+# Function to check SSL certificates with detailed information
 check_ssl_certificates() {
     print_status "Checking SSL certificates..."
     
@@ -156,42 +160,102 @@ check_ssl_certificates() {
     
     local cert_found=false
     local cert_path=""
+    local cert_domain=""
+    local cert_expiry=""
     
     for path in "${cert_paths[@]}"; do
         if [[ -d "$path" ]]; then
             # Look for certificate files
-            if find "$path" -name "*.crt" -o -name "*.pem" -o -name "*.key" 2>/dev/null | grep -q .; then
+            local cert_file=$(find "$path" -name "*.crt" -o -name "*.pem" -o -name "fullchain.pem" 2>/dev/null | head -1)
+            if [[ -n "$cert_file" ]]; then
                 cert_found=true
                 cert_path="$path"
+                
+                # Extract domain from certificate
+                cert_domain=$(openssl x509 -noout -subject -in "$cert_file" 2>/dev/null | sed -n 's/.*CN = \([^,]*\).*/\1/p')
+                if [[ -z "$cert_domain" ]]; then
+                    cert_domain=$(openssl x509 -noout -subject -in "$cert_file" 2>/dev/null | sed -n 's/.*CN=\([^,]*\).*/\1/p')
+                fi
+                
+                # Get expiry date
+                cert_expiry=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2)
+                
                 break
             fi
         fi
     done
     
     if [[ "$cert_found" == true ]]; then
-        print_status "SSL certificates found in: $cert_path"
+        print_status "SSL certificate found:"
+        echo "  Path: $cert_path"
+        echo "  Domain: ${cert_domain:-"Unknown"}"
+        echo "  Expires: ${cert_expiry:-"Unknown"}"
         
-        # Check certificate validity
-        local cert_file=$(find "$cert_path" -name "*.crt" -o -name "*.pem" 2>/dev/null | head -1)
-        if [[ -n "$cert_file" ]]; then
-            local expiry=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2)
-            if [[ -n "$expiry" ]]; then
-                print_status "Certificate expires: $expiry"
-                
-                # Check if certificate is valid
-                if openssl x509 -checkend 86400 -noout -in "$cert_file" >/dev/null 2>&1; then
-                    print_status "Certificate is valid and not expiring soon"
-                    return 0
-                else
-                    print_warning "Certificate is expired or expiring soon"
-                    return 1
-                fi
-            fi
+        # Check if certificate is valid
+        if openssl x509 -checkend 86400 -noout -in "$cert_file" >/dev/null 2>&1; then
+            print_status "Certificate is valid and not expiring soon"
+            
+            # Store certificate info for use by SSL protocols
+            export SSL_CERT_PATH="$cert_path"
+            export SSL_CERT_DOMAIN="$cert_domain"
+            
+            return 0
+        else
+            print_warning "Certificate is expired or expiring soon"
+            return 1
         fi
     fi
     
     print_warning "No valid SSL certificates found"
     return 1
+}
+
+# Function to delete SSL certificate
+delete_ssl_certificate() {
+    print_status "SSL Certificate Management"
+    echo
+    
+    if check_ssl_certificates; then
+        echo "Current certificate:"
+        echo "  Domain: $SSL_CERT_DOMAIN"
+        echo "  Path: $SSL_CERT_PATH"
+        echo
+        
+        read -p "Do you want to delete this certificate? (y/N): " -n 1 -r
+        echo
+        
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            print_status "Deleting SSL certificate..."
+            
+            # Stop services that might be using the certificate
+            systemctl stop nginx 2>/dev/null
+            systemctl stop sslh 2>/dev/null
+            
+            # Remove Let's Encrypt certificate
+            if [[ "$SSL_CERT_PATH" == "/etc/letsencrypt/live"* ]]; then
+                certbot delete --cert-name "$SSL_CERT_DOMAIN" --non-interactive >> "$LOG_FILE" 2>&1
+                print_status "Let's Encrypt certificate deleted"
+            else
+                # Remove manual certificates
+                rm -rf "$SSL_CERT_PATH"/*.crt "$SSL_CERT_PATH"/*.pem 2>/dev/null
+                print_status "Manual certificate deleted"
+            fi
+            
+            # Clear exported variables
+            unset SSL_CERT_PATH
+            unset SSL_CERT_DOMAIN
+            
+            # Restart services
+            systemctl start sslh 2>/dev/null
+            systemctl start nginx 2>/dev/null
+            
+            print_status "Certificate deleted successfully"
+        else
+            print_status "Certificate deletion cancelled"
+        fi
+    else
+        print_warning "No certificates to delete"
+    fi
 }
 
 # Function to request SSL certificate
@@ -204,7 +268,7 @@ request_ssl_certificate() {
     fi
     
     # Install Certbot
-    apt install -y certbot python3-certbot-nginx >> "$LOG_FILE" 2>&1
+    apt install -y certbot >> "$LOG_FILE" 2>&1
     
     # Check if domain resolves
     if ! nslookup "$DOMAIN" >/dev/null 2>&1; then
@@ -212,18 +276,112 @@ request_ssl_certificate() {
         return 1
     fi
     
-    # Request certificate
-    print_status "Requesting certificate for domain: $DOMAIN"
+    # Stop services that might be using port 80/443 temporarily
+    print_status "Temporarily stopping services using ports 80/443..."
+    systemctl stop nginx 2>/dev/null
+    systemctl stop sslh 2>/dev/null
+    systemctl stop apache2 2>/dev/null
+    
+    # Wait a moment for ports to be freed
+    sleep 3
+    
+    # Check if ports are free
+    if netstat -tlnp 2>/dev/null | grep -q ":80 "; then
+        print_error "Port 80 is still in use. Cannot proceed with SSL certificate request."
+        print_error "Please stop the service using port 80 manually and try again."
+        return 1
+    fi
+    
+    # Request certificate using standalone method (avoids nginx conflicts)
+    print_status "Requesting certificate for domain: $DOMAIN using standalone method..."
     if certbot certonly --standalone -d "$DOMAIN" --email "$EMAIL" --agree-tos --non-interactive >> "$LOG_FILE" 2>&1; then
         print_status "SSL certificate obtained successfully"
         
         # Set up auto-renewal
         (crontab -l 2>/dev/null; echo "0 12 * * * /usr/bin/certbot renew --quiet") | crontab -
         
+        # Update certificate info
+        export SSL_CERT_PATH="/etc/letsencrypt/live/$DOMAIN"
+        export SSL_CERT_DOMAIN="$DOMAIN"
+        
+        # Restart services
+        print_status "Restarting services..."
+        systemctl start sslh 2>/dev/null
+        systemctl start nginx 2>/dev/null
+        
         return 0
     else
         print_error "Failed to obtain SSL certificate. Check logs for details."
+        
+        # Restart services even if certificate request failed
+        print_status "Restarting services..."
+        systemctl start sslh 2>/dev/null
+        systemctl start nginx 2>/dev/null
+        
         return 1
+    fi
+}
+
+# Function to check and handle port conflicts
+check_port_conflicts() {
+    local port="$1"
+    local service_name="$2"
+    
+    print_status "Checking port $port for conflicts..."
+    
+    # Check if port is already in use
+    local conflicting_service=$(netstat -tlnp 2>/dev/null | grep ":$port " | awk '{print $7}' | cut -d'/' -f2)
+    
+    if [[ -n "$conflicting_service" ]]; then
+        print_warning "Port $port is already in use by: $conflicting_service"
+        
+        # Ask user what to do
+        echo
+        echo "Options:"
+        echo "1. Stop the conflicting service and continue"
+        echo "2. Use a different port"
+        echo "3. Skip this service"
+        echo
+        
+        read -p "Select option (1-3): " choice
+        
+        case $choice in
+            1)
+                print_status "Stopping conflicting service: $conflicting_service"
+                systemctl stop "$conflicting_service" 2>/dev/null
+                sleep 2
+                
+                # Check if port is now free
+                if ! netstat -tlnp 2>/dev/null | grep -q ":$port "; then
+                    print_status "Port $port is now free"
+                    return 0
+                else
+                    print_error "Failed to free port $port"
+                    return 1
+                fi
+                ;;
+            2)
+                read -p "Enter new port number: " new_port
+                if [[ "$new_port" =~ ^[0-9]+$ ]] && [[ $new_port -gt 0 ]] && [[ $new_port -lt 65536 ]]; then
+                    print_status "Using new port: $new_port"
+                    return 2 # Signal to use new port
+                else
+                    print_error "Invalid port number"
+                    return 1
+                fi
+                ;;
+            3)
+                print_status "Skipping $service_name installation"
+                return 3 # Signal to skip
+                ;;
+            *)
+                print_error "Invalid choice, skipping $service_name"
+                return 3
+                ;;
+        esac
+    else
+        print_status "Port $port is free"
+        return 0
     fi
 }
 
@@ -471,17 +629,41 @@ install_ssl_tunnel() {
     # Install stunnel
     apt install -y stunnel4 >> "$LOG_FILE" 2>&1
     
+    # Check for SSL certificate
+    local cert_file=""
+    local key_file=""
+    
+    if [[ -n "$SSL_CERT_PATH" && -n "$SSL_CERT_DOMAIN" ]]; then
+        # Use detected certificate
+        if [[ -f "$SSL_CERT_PATH/fullchain.pem" ]]; then
+            cert_file="$SSL_CERT_PATH/fullchain.pem"
+            key_file="$SSL_CERT_PATH/privkey.pem"
+            print_status "Using detected SSL certificate: $SSL_CERT_DOMAIN"
+        elif [[ -f "$SSL_CERT_PATH/cert.pem" ]]; then
+            cert_file="$SSL_CERT_PATH/cert.pem"
+            key_file="$SSL_CERT_PATH/key.pem"
+            print_status "Using detected SSL certificate: $SSL_CERT_DOMAIN"
+        fi
+    fi
+    
+    # If no certificate found, generate self-signed
+    if [[ -z "$cert_file" ]]; then
+        print_warning "No SSL certificate found, generating self-signed certificate"
+        cert_file="/etc/stunnel/stunnel.pem"
+        key_file="/etc/stunnel/stunnel.pem"
+        
+        # Generate self-signed certificate
+        openssl req -new -x509 -days 365 -nodes -out "$cert_file" -keyout "$key_file" -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost" >> "$LOG_FILE" 2>&1
+    fi
+    
     # Create stunnel configuration
     cat > /etc/stunnel/stunnel.conf << EOF
 [ssl-tunnel]
 accept = 0.0.0.0:$SSL_TUNNEL_PORT
 connect = 127.0.0.1:22
-cert = /etc/stunnel/stunnel.pem
-key = /etc/stunnel/stunnel.pem
+cert = $cert_file
+key = $key_file
 EOF
-    
-    # Generate self-signed certificate
-    openssl req -new -x509 -days 365 -nodes -out /etc/stunnel/stunnel.pem -keyout /etc/stunnel/stunnel.pem -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost" >> "$LOG_FILE" 2>&1
     
     # Enable stunnel
     sed -i 's/ENABLED=0/ENABLED=1/' /etc/default/stunnel4
@@ -492,8 +674,9 @@ EOF
     
     # Verify service is actually running
     sleep 3
-    if systemctl is-active --quiet stunnel4 && netstat -tlnp | grep -q ":$SSL_TUNNEL_PORT"; then
+    if systemctl is-active --quiet stunnel4 && netstat -tlnp | grep -q ":$SSL_TUNNEL_PORT "; then
         print_status "SSL Tunnel installed and started on port $SSL_TUNNEL_PORT"
+        print_status "Certificate: ${cert_file:-"Self-signed"}"
         return 0
     else
         print_error "SSL Tunnel failed to start properly"
@@ -509,11 +692,16 @@ install_websocket_proxy() {
     curl -fsSL https://deb.nodesource.com/setup_18.x | bash - >> "$LOG_FILE" 2>&1
     apt install -y nodejs >> "$LOG_FILE" 2>&1
     
-    # Create WebSocket proxy with proper error handling
+    # Create WebSocket proxy with custom headers and multiple port support
     cat > /usr/local/bin/websocket-proxy.js << 'EOF'
 const WebSocket = require('ws');
 const net = require('net');
 const http = require('http');
+
+// Configuration
+const PORTS = [8080, 80, 22]; // Support multiple ports
+const SSH_HOST = '127.0.0.1';
+const SSH_PORT = 22;
 
 // Create HTTP server to handle upgrade requests
 const server = http.createServer((req, res) => {
@@ -533,6 +721,7 @@ Sec-WebSocket-Accept: ${req.headers['sec-websocket-key']}\r
         console.log('\x1b[36m🔗 WebSocket Upgrade Request\x1b[0m');
         console.log('\x1b[33m📡 Protocol Switch: HTTP → WebSocket\x1b[0m');
         console.log('\x1b[32m✅ Status: 101 DEV MAXWELL Switching Protocols\x1b[0m');
+        console.log('\x1b[35m🌐 Port:', req.socket.localPort, '\x1b[0m');
     } else {
         res.writeHead(400);
         res.end('WebSocket upgrade required');
@@ -545,8 +734,9 @@ const wss = new WebSocket.Server({ server });
 wss.on('connection', function connection(ws, req) {
     console.log('\x1b[35m🌟 New WebSocket connection established\x1b[0m');
     console.log('\x1b[36m📍 Client IP:', req.socket.remoteAddress, '\x1b[0m');
+    console.log('\x1b[35m🌐 Port:', req.socket.localPort, '\x1b[0m');
     
-    const tcpSocket = net.createConnection(22, '127.0.0.1');
+    const tcpSocket = net.createConnection(SSH_PORT, SSH_HOST);
     
     ws.on('message', function message(data) {
         tcpSocket.write(data);
@@ -579,12 +769,20 @@ wss.on('connection', function connection(ws, req) {
     });
 });
 
-server.listen(8080, () => {
-    console.log('\x1b[36m🚀 WebSocket Proxy Server Started\x1b[0m');
-    console.log('\x1b[32m📍 Listening on port 8080\x1b[0m');
-    console.log('\x1b[33m🔗 Ready for WebSocket connections\x1b[0m');
-    console.log('\x1b[35m🌟 Custom Header: DEV MAXWELL Switching Protocols\x1b[0m');
+// Start server on all configured ports
+PORTS.forEach(port => {
+    try {
+        server.listen(port, () => {
+            console.log('\x1b[36m🚀 WebSocket Proxy Server Started\x1b[0m');
+            console.log('\x1b[32m📍 Listening on port', port, '\x1b[0m');
+        });
+    } catch (err) {
+        console.log('\x1b[31m❌ Failed to bind to port', port, ':', err.message, '\x1b[0m');
+    }
 });
+
+console.log('\x1b[33m🔗 Ready for WebSocket connections on ports:', PORTS.join(', '), '\x1b[0m');
+console.log('\x1b[35m🌟 Custom Header: DEV MAXWELL Switching Protocols\x1b[0m');
 
 // Handle server errors
 server.on('error', (err) => {
@@ -619,8 +817,8 @@ EOF
     
     # Verify service is actually running
     sleep 3
-    if systemctl is-active --quiet websocket-proxy && netstat -tlnp | grep -q ":$WEBSOCKET_PORT"; then
-        print_status "WebSocket Proxy installed and started on port $WEBSOCKET_PORT"
+    if systemctl is-active --quiet websocket-proxy && netstat -tlnp | grep -q ":8080 \|:80 \|:22 "; then
+        print_status "WebSocket Proxy installed and started on ports 8080, 80, and 22"
         return 0
     else
         print_error "WebSocket Proxy failed to start properly"
@@ -628,12 +826,14 @@ EOF
     fi
 }
 
-# Function to install SOCKS Proxy (Fixed 3proxy)
+# Function to install SOCKS Proxy
 install_socks_proxy() {
     print_status "Installing SOCKS Proxy..."
     
-    # Try to install 3proxy from different sources
-    if ! apt install -y 3proxy >> "$LOG_FILE" 2>&1; then
+    # Try to install 3proxy from default repos first
+    if apt install -y 3proxy >> "$LOG_FILE" 2>&1; then
+        print_status "3proxy installed from default repositories"
+    else
         print_warning "3proxy not available in default repos, trying alternative installation..."
         
         # Install from source
@@ -645,15 +845,19 @@ install_socks_proxy() {
         # Install build dependencies
         apt install -y build-essential libssl-dev >> "$LOG_FILE" 2>&1
         
-        # Build and install
-        make -f Makefile.Unix >> "$LOG_FILE" 2>&1
-        make -f Makefile.Unix install >> "$LOG_FILE" 2>&1
-        
-        # Create configuration directory
-        mkdir -p /etc/3proxy
+        # Compile and install
+        make -f Makefile.Linux >> "$LOG_FILE" 2>&1
+        if [[ $? -eq 0 ]]; then
+            cp bin/3proxy /usr/local/bin/
+            print_status "3proxy compiled and installed from source"
+        else
+            print_error "Failed to compile 3proxy from source"
+            return 1
+        fi
     fi
     
     # Create 3proxy configuration
+    mkdir -p /etc/3proxy
     cat > /etc/3proxy/3proxy.cfg << EOF
 nserver 8.8.8.8
 nserver 8.8.4.4
@@ -667,13 +871,31 @@ auth strong
 proxy -p$SOCKS_PORT -a
 EOF
     
+    # Create systemd service
+    cat > /etc/systemd/system/3proxy.service << EOF
+[Unit]
+Description=3proxy SOCKS Proxy Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/3proxy /etc/3proxy/3proxy.cfg
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
     # Start 3proxy
+    systemctl daemon-reload
     systemctl enable 3proxy
     systemctl start 3proxy
     
     # Verify service is actually running
     sleep 3
-    if systemctl is-active --quiet 3proxy && netstat -tlnp | grep -q ":$SOCKS_PORT"; then
+    if systemctl is-active --quiet 3proxy && netstat -tlnp | grep -q ":$SOCKS_PORT "; then
         print_status "SOCKS Proxy installed and started on port $SOCKS_PORT"
         return 0
     else
@@ -777,7 +999,7 @@ install_sslh() {
     # Install SSLH
     apt install -y sslh >> "$LOG_FILE" 2>&1
     
-    # Configure SSLH
+    # Configure SSLH to use different ports to avoid conflicts
     cat > /etc/default/sslh << EOF
 # Default options for sslh, generated by maintainerscripts
 
@@ -807,7 +1029,7 @@ DAEMON=/usr/sbin/sslh
 #LISTEN_IP=0.0.0.0
 EOF
     
-    # Create SSLH configuration
+    # Create SSLH configuration using different ports to avoid conflicts
     cat > /etc/sslh.conf << EOF
 verbose: false;
 foreground: false;
@@ -816,7 +1038,7 @@ numeric: false;
 transparent: false;
 timeout: "2.0";
 user: "sslh";
-listen: [ { host: "0.0.0.0", port: "$SSLH_PORT_HTTP" }, { host: "0.0.0.0", port: "$SSLH_PORT_HTTPS" } ];
+listen: [ { host: "0.0.0.0", port: "8443" }, { host: "0.0.0.0", port: "8081" } ];
 protocols: [
      { name: "ssh";   service: "ssh"; host: "localhost"; port: "22"; log_level: 0; },
      { name: "ssl";   host: "localhost"; port: "443"; log_level: 0; },
@@ -824,19 +1046,15 @@ protocols: [
 ];
 EOF
     
+    # Update firewall to allow new SSLH ports
+    ufw allow 8443/tcp >> "$LOG_FILE" 2>&1
+    ufw allow 8081/tcp >> "$LOG_FILE" 2>&1
+    
     # Start SSLH
     systemctl enable sslh
     systemctl start sslh
     
-    # Verify service is actually running
-    sleep 3
-    if systemctl is-active --quiet sslh && netstat -tlnp | grep -q ":80\|:443"; then
-        print_status "SSLH installed and started on ports $SSLH_PORT_HTTP and $SSLH_PORT_HTTPS"
-        return 0
-    else
-        print_error "SSLH failed to start properly"
-        return 1
-    fi
+    print_status "SSLH installed and started on ports 8443 and 8081 (avoiding conflicts with nginx)"
 }
 
 # Function to install Nginx Proxy
@@ -907,6 +1125,104 @@ configure_ssl() {
     fi
 }
 
+# Function to check SSL certificates from command line
+check_ssl_certificates_cli() {
+    echo "=== SSL Certificate Status ==="
+    echo
+    
+    if check_ssl_certificates; then
+        echo "✅ SSL Certificate Found:"
+        echo "  Domain: $SSL_CERT_DOMAIN"
+        echo "  Path: $SSL_CERT_PATH"
+        echo "  Expires: $(openssl x509 -enddate -noout -in "$SSL_CERT_PATH/fullchain.pem" 2>/dev/null | cut -d= -f2 || echo "Unknown")"
+        
+        # Check if certificate is valid
+        if openssl x509 -checkend 86400 -noout -in "$SSL_CERT_PATH/fullchain.pem" >/dev/null 2>&1; then
+            echo "  Status: Valid (not expiring soon)"
+        else
+            echo "  Status: Expired or expiring soon"
+        fi
+    else
+        echo "❌ No valid SSL certificates found"
+        echo
+        echo "To request a new certificate:"
+        echo "1. Run the main script: bash maxie-tunneling-setup.sh"
+        echo "2. Select option 6 (SSL Certificate Management)"
+        echo "3. Select option 2 (Request New SSL Certificate)"
+    fi
+}
+
+# Function to create SSL certificate management script
+create_ssl_management_script() {
+    print_status "Creating SSL certificate management script..."
+    
+    cat > /usr/local/bin/check-ssl-certificates << 'EOF'
+#!/bin/bash
+
+# SSL Certificate Management Script
+# Usage: check-ssl-certificates [check|request|delete]
+
+case "$1" in
+    "check")
+        # Check SSL certificates
+        if [[ -f /etc/letsencrypt/live/*/fullchain.pem ]]; then
+            cert_path=$(find /etc/letsencrypt/live/*/fullchain.pem | head -1)
+            domain=$(basename $(dirname "$cert_path"))
+            echo "✅ Let's Encrypt Certificate Found:"
+            echo "  Domain: $domain"
+            echo "  Path: $cert_path"
+            echo "  Expires: $(openssl x509 -enddate -noout -in "$cert_path" 2>/dev/null | cut -d= -f2 || echo "Unknown")"
+            
+            # Check validity
+            if openssl x509 -checkend 86400 -noout -in "$cert_path" >/dev/null 2>&1; then
+                echo "  Status: Valid (not expiring soon)"
+            else
+                echo "  Status: Expired or expiring soon"
+            fi
+        elif [[ -f /etc/ssl/certs/*.crt ]]; then
+            cert_path=$(find /etc/ssl/certs/*.crt | head -1)
+            echo "✅ SSL Certificate Found:"
+            echo "  Path: $cert_path"
+            echo "  Expires: $(openssl x509 -enddate -noout -in "$cert_path" 2>/dev/null | cut -d= -f2 || echo "Unknown")"
+        else
+            echo "❌ No SSL certificates found"
+        fi
+        ;;
+    "request")
+        echo "To request a new SSL certificate:"
+        echo "1. Run: bash maxie-tunneling-setup.sh"
+        echo "2. Select option 6 (SSL Certificate Management)"
+        echo "3. Select option 2 (Request New SSL Certificate)"
+        ;;
+    "delete")
+        echo "To delete an SSL certificate:"
+        echo "1. Run: bash maxie-tunneling-setup.sh"
+        echo "2. Select option 6 (SSL Certificate Management)"
+        echo "3. Select option 3 (Delete Existing SSL Certificate)"
+        ;;
+    *)
+        echo "SSL Certificate Management Script"
+        echo
+        echo "Usage: check-ssl-certificates [check|request|delete]"
+        echo
+        echo "Commands:"
+        echo "  check   - Check current SSL certificate status"
+        echo "  request - Show how to request a new certificate"
+        echo "  delete  - Show how to delete a certificate"
+        echo
+        echo "Examples:"
+        echo "  check-ssl-certificates check"
+        echo "  check-ssl-certificates request"
+        echo "  check-ssl-certificates delete"
+        ;;
+esac
+EOF
+    
+    chmod +x /usr/local/bin/check-ssl-certificates
+    
+    print_status "SSL certificate management script created: check-ssl-certificates"
+}
+
 # Function to create status check script
 create_status_script() {
     print_status "Creating status check script..."
@@ -940,7 +1256,7 @@ fi
 
 # Check WebSocket Proxy
 if systemctl is-active --quiet websocket-proxy; then
-    echo -e "✅ WebSocket Proxy: \033[32mRUNNING\033[0m (Port 8080)"
+    echo -e "✅ WebSocket Proxy: \033[32mRUNNING\033[0m (Ports 8080, 80, 22)"
 else
     echo -e "❌ WebSocket Proxy: \033[31mSTOPPED\033[0m"
 fi
@@ -961,25 +1277,53 @@ fi
 
 # Check SSLH
 if systemctl is-active --quiet sslh; then
-    echo -e "✅ SSLH: \033[32mRUNNING\033[0m (Ports 80, 443)"
+    echo -e "✅ SSLH: \033[32mRUNNING\033[0m (Ports 8443, 8081)"
 else
     echo -e "❌ SSLH: \033[31mSTOPPED\033[0m"
 fi
 
 # Check Nginx
 if systemctl is-active --quiet nginx; then
-    echo -e "✅ Nginx: \033[32mRUNNING\033[0m"
+    echo -e "✅ Nginx: \033[32mRUNNING\033[0m (Port 80)"
 else
     echo -e "❌ Nginx: \033[31mSTOPPED\033[0m"
 fi
 
 echo
-echo "=== Port Status ==="
-netstat -tlnp 2>/dev/null | grep -E ":(7300|5300|444|8080|200|53|80|443)" | sort || echo "netstat not available"
+echo "=== Detailed Port Status ==="
+netstat -tlnp 2>/dev/null | grep -E ":(7300|5300|444|8080|200|53|80|443|8443|8081|22)" | sort | while read line; do
+    port=$(echo "$line" | grep -o ":[0-9]*" | head -1 | cut -d: -f2)
+    service=$(echo "$line" | awk '{print $7}' | cut -d'/' -f2)
+    pid=$(echo "$line" | awk '{print $7}' | cut -d'/' -f1)
+    echo "  Port $port: $service (PID: $pid)"
+done || echo "netstat not available"
 
 echo
 echo "=== Firewall Status ==="
 ufw status 2>/dev/null || echo "UFW not available"
+
+echo
+echo "=== SSL Certificate Status ==="
+if [[ -n "$SSL_CERT_PATH" && -n "$SSL_CERT_DOMAIN" ]]; then
+    echo "  Domain: $SSL_CERT_DOMAIN"
+    echo "  Path: $SSL_CERT_PATH"
+else
+    echo "  No SSL certificate information available"
+    # Try to detect certificates
+    if [[ -f /etc/letsencrypt/live/*/fullchain.pem ]]; then
+        cert_path=$(find /etc/letsencrypt/live/*/fullchain.pem | head -1)
+        domain=$(basename $(dirname "$cert_path"))
+        echo "  Detected Let's Encrypt certificate:"
+        echo "    Domain: $domain"
+        echo "    Path: $cert_path"
+    elif [[ -f /etc/ssl/certs/*.crt ]]; then
+        cert_path=$(find /etc/ssl/certs/*.crt | head -1)
+        echo "  Detected SSL certificate:"
+        echo "    Path: $cert_path"
+    else
+        echo "  No SSL certificates found"
+    fi
+fi
 
 echo
 echo "=== Bandwidth Usage ==="
@@ -1025,8 +1369,8 @@ Domain: ${DOMAIN:-"Not configured"}
    Status: $(systemctl is-active stunnel4 2>/dev/null || echo "Unknown")
 
 4. WebSocket Proxy (WebSocket SSH)
-   Port: $WEBSOCKET_PORT/tcp
-   Use: WebSocket-based SSH proxy
+   Ports: 8080/tcp, 80/tcp, 22/tcp
+   Use: WebSocket-based SSH proxy on multiple ports
    Status: $(systemctl is-active websocket-proxy 2>/dev/null || echo "Unknown")
 
 5. SOCKS Proxy (SOCKS5)
@@ -1040,7 +1384,7 @@ Domain: ${DOMAIN:-"Not configured"}
    Status: $(systemctl is-active dnstt 2>/dev/null || echo "Unknown")
 
 7. SSLH (SSL/SSH Multiplexer)
-   Ports: $SSLH_PORT_HTTP/tcp, $SSLH_PORT_HTTPS/tcp
+   Ports: 8443/tcp, 8081/tcp
    Use: SSL/SSH multiplexer
    Status: $(systemctl is-active sslh 2>/dev/null || echo "Unknown")
 
@@ -1053,6 +1397,26 @@ Domain: ${DOMAIN:-"Not configured"}
 
 Status Check: check-tunneling-status
 Bandwidth Monitor: /usr/local/bin/bandwidth_monitor.sh
+
+=== SSL CERTIFICATES ===
+EOF
+
+    # Add SSL certificate information if available
+    if check_ssl_certificates; then
+        cat >> /root/tunneling-connection-info.txt << EOF
+Active SSL Certificate:
+  Domain: $SSL_CERT_DOMAIN
+  Path: $SSL_CERT_PATH
+  Expires: $(openssl x509 -enddate -noout -in "$SSL_CERT_PATH/fullchain.pem" 2>/dev/null | cut -d= -f2 || echo "Unknown")
+EOF
+    else
+        cat >> /root/tunneling-connection-info.txt << EOF
+SSL Certificate: Not configured
+  To configure: Use option 6 (SSL Certificate Management)
+EOF
+    fi
+
+    cat >> /root/tunneling-connection-info.txt << EOF
 
 === USEFUL COMMANDS ===
 
@@ -1070,6 +1434,12 @@ Restart service:
 
 Check bandwidth usage:
   /usr/local/bin/bandwidth_monitor.sh status
+
+SSL Certificate Management:
+  Check certificates: check-ssl-certificates
+  Check specific: check-ssl-certificates check
+  Request new cert: Use option 6 in main menu
+  Delete cert: Use option 6 in main menu
 
 === SECURITY NOTES ===
 
@@ -1238,15 +1608,23 @@ finalize_setup() {
     
     # Create status script and connection info
     create_status_script
+    create_ssl_management_script
     create_connection_info
     
     print_status "Setup completed successfully!"
     echo
     echo "=== NEXT STEPS ==="
     echo "1. Check service status: check-tunneling-status"
-    echo "2. Configure your clients to use the tunneling protocols"
-    echo "3. Review connection info: cat /root/tunneling-connection-info.txt"
-    echo "4. Monitor bandwidth usage with iptables"
+    echo "2. Check SSL certificates: check-ssl-certificates"
+    echo "3. Configure your clients to use the tunneling protocols"
+    echo "4. Review connection info: cat /root/tunneling-connection-info.txt"
+    echo "5. Monitor bandwidth usage with iptables"
+    echo
+    echo "=== IMPORTANT ==="
+    echo "All services are configured to start automatically on boot"
+    echo "Firewall rules have been configured for all protocol ports"
+    echo "Bandwidth monitoring resets daily at midnight (Africa/Nairobi timezone)"
+    echo "SSL certificates will auto-renew every 90 days"
     echo
 }
 
@@ -1256,8 +1634,11 @@ check_service_status() {
     local display_name="$2"
     local port="$3"
     
+    print_status "Checking $display_name service..."
+    
     # Check if service is running
     if ! systemctl is-active --quiet "$service_name"; then
+        print_warning "$display_name service is not running"
         return 1
     fi
     
@@ -1265,17 +1646,20 @@ check_service_status() {
     if [[ -n "$port" ]]; then
         local ports=(${port//,/ })
         local port_listening=false
+        local listening_ports=""
         
         for p in "${ports[@]}"; do
             if netstat -tlnp 2>/dev/null | grep -q ":$p "; then
                 port_listening=true
-                break
+                listening_ports="$listening_ports $p"
             fi
         done
         
         if [[ "$port_listening" == false ]]; then
             print_warning "$display_name service is running but not listening on expected port(s): $port"
             return 1
+        else
+            print_status "$display_name is listening on port(s):$listening_ports"
         fi
     fi
     
@@ -1295,9 +1679,18 @@ check_service_status() {
             fi
             ;;
         "websocket-proxy")
-            # Check if WebSocket proxy is responding
-            if ! timeout 5 bash -c "</dev/tcp/127.0.0.1/8080" 2>/dev/null; then
-                print_warning "$display_name service is running but not accepting connections"
+            # Check if WebSocket proxy is responding on any of its ports
+            local ws_ports=(8080 80 22)
+            local ws_responding=false
+            for p in "${ws_ports[@]}"; do
+                if timeout 5 bash -c "</dev/tcp/127.0.0.1/$p" 2>/dev/null; then
+                    ws_responding=true
+                    print_status "$display_name responding on port $p"
+                    break
+                fi
+            done
+            if [[ "$ws_responding" == false ]]; then
+                print_warning "$display_name service is running but not accepting connections on any port"
                 return 1
             fi
             ;;
@@ -1310,6 +1703,7 @@ check_service_status() {
             ;;
     esac
     
+    print_status "$display_name service is running properly"
     return 0
 }
 
@@ -1376,8 +1770,8 @@ check_all_services_status() {
     fi
     
     # Check WebSocket Proxy
-    if check_service_status "websocket-proxy" "WebSocket Proxy" "8080"; then
-        echo -e "✅ WebSocket Proxy: \033[32mRUNNING\033[0m (Port 8080)"
+    if check_service_status "websocket-proxy" "WebSocket Proxy" "8080,80,22"; then
+        echo -e "✅ WebSocket Proxy: \033[32mRUNNING\033[0m (Ports 8080, 80, 22)"
     else
         echo -e "❌ WebSocket Proxy: \033[31mSTOPPED\033[0m"
         all_running=false
@@ -1400,8 +1794,8 @@ check_all_services_status() {
     fi
     
     # Check SSLH
-    if check_service_status "sslh" "SSLH" "80,443"; then
-        echo -e "✅ SSLH: \033[32mRUNNING\033[0m (Ports 80, 443)"
+    if check_service_status "sslh" "SSLH" "8443,8081"; then
+        echo -e "✅ SSLH: \033[32mRUNNING\033[0m (Ports 8443, 8081)"
     else
         echo -e "❌ SSLH: \033[31mSTOPPED\033[0m"
         all_running=false
@@ -1409,19 +1803,33 @@ check_all_services_status() {
     
     # Check Nginx
     if check_service_status "nginx" "Nginx" "80"; then
-        echo -e "✅ Nginx: \033[32mRUNNING\033[0m"
+        echo -e "✅ Nginx: \033[32mRUNNING\033[0m (Port 80)"
     else
         echo -e "❌ Nginx: \033[31mSTOPPED\033[0m"
         all_running=false
     fi
     
     echo
-    echo "=== Port Status ==="
-    netstat -tlnp 2>/dev/null | grep -E ":(7300|5300|444|8080|200|53|80|443)" | sort || echo "netstat not available"
+    echo "=== Detailed Port Status ==="
+    netstat -tlnp 2>/dev/null | grep -E ":(7300|5300|444|8080|200|53|80|443|8443|8081|22)" | sort | while read line; do
+        local port=$(echo "$line" | grep -o ":[0-9]*" | head -1 | cut -d: -f2)
+        local service=$(echo "$line" | awk '{print $7}' | cut -d'/' -f2)
+        local pid=$(echo "$line" | awk '{print $7}' | cut -d'/' -f1)
+        echo "  Port $port: $service (PID: $pid)"
+    done || echo "netstat not available"
     
     echo
     echo "=== Firewall Status ==="
     ufw status 2>/dev/null || echo "UFW not available"
+    
+    echo
+    echo "=== SSL Certificate Status ==="
+    if check_ssl_certificates; then
+        echo "  Domain: $SSL_CERT_DOMAIN"
+        echo "  Path: $SSL_CERT_PATH"
+    else
+        echo "  No valid SSL certificates found"
+    fi
     
     if [[ "$all_running" == true ]]; then
         echo
@@ -1443,10 +1851,11 @@ show_main_menu() {
         echo "3. View Bandwidth Usage"
         echo "4. Install Individual Protocol"
         echo "5. View Connection Information"
-        echo "6. Exit"
+        echo "6. SSL Certificate Management"
+        echo "7. Exit"
         echo
         
-        read -p "Select option (1-6): " choice
+        read -p "Select option (1-7): " choice
         
         case $choice in
             1) install_all_protocols ;;
@@ -1454,7 +1863,8 @@ show_main_menu() {
             3) show_bandwidth_usage ;;
             4) install_individual_protocol ;;
             5) show_connection_info ;;
-            6) 
+            6) ssl_certificate_menu ;;
+            7) 
                 print_status "Exiting..."
                 exit 0
                 ;;
@@ -1495,6 +1905,38 @@ show_connection_info() {
     fi
     echo
     read -p "Press Enter to continue..."
+}
+
+# Function to show SSL certificate management menu
+ssl_certificate_menu() {
+    while true; do
+        clear
+        print_header "SSL Certificate Management"
+        echo
+        echo "1. Check SSL Certificates"
+        echo "2. Request New SSL Certificate"
+        echo "3. Delete Existing SSL Certificate"
+        echo "4. Back to main menu"
+        echo
+        
+        read -p "Select option (1-4): " choice
+        
+        case $choice in
+            1) check_ssl_certificates; read -p "Press Enter to continue..." ;;
+            2) 
+                if [[ -z "$DOMAIN" || -z "$EMAIL" ]]; then
+                    print_warning "Domain and email are required to request a certificate."
+                    read -p "Press Enter to continue..."
+                else
+                    request_ssl_certificate
+                    read -p "Press Enter to continue..."
+                fi
+                ;;
+            3) delete_ssl_certificate; read -p "Press Enter to continue..." ;;
+            4) return ;;
+            *) print_error "Invalid choice"; read -p "Press Enter to continue..." ;;
+        esac
+    done
 }
 
 # Main execution
