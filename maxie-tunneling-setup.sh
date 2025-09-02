@@ -132,12 +132,20 @@ configure_firewall() {
         ufw allow $WEBSOCKET_PORT/tcp >> "$LOG_FILE" 2>&1
         ufw allow $SOCKS_PORT/tcp >> "$LOG_FILE" 2>&1
         ufw allow $DNSTT_PORT/udp >> "$LOG_FILE" 2>&1
+        
         # Allow nginx on standard ports
         ufw allow 80/tcp >> "$LOG_FILE" 2>&1
         ufw allow 443/tcp >> "$LOG_FILE" 2>&1
+        
         # Allow SSLH on alternative ports to avoid conflicts
         ufw allow 8443/tcp >> "$LOG_FILE" 2>&1
         ufw allow 8081/tcp >> "$LOG_FILE" 2>&1
+        
+        # Allow additional WebSocket proxy ports
+        ufw allow 2222/tcp >> "$LOG_FILE" 2>&1  # SSH WebSocket
+        ufw allow 8082/tcp >> "$LOG_FILE" 2>&1  # HTTP WebSocket
+        ufw allow 3128/tcp >> "$LOG_FILE" 2>&1  # Custom proxy
+        ufw allow 8083/tcp >> "$LOG_FILE" 2>&1  # Custom proxy
         
         # Enable UFW
         ufw --force enable >> "$LOG_FILE" 2>&1
@@ -499,7 +507,7 @@ install_badvpn() {
     make install >> "$LOG_FILE" 2>&1
     
     # Create systemd service
-    cat > /etc/systemd/system/badvpn.service << EOF
+    cat > /etc/systemd/system/badvpn.service << 'BADVPN_SERVICE_EOF'
 [Unit]
 Description=BadVPN UDP Tunneling Service
 After=network.target
@@ -507,13 +515,16 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 0.0.0.0:$BADVPN_PORT --max-clients 1000 --max-connections-for-client 1000
+ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 0.0.0.0:PORT_PLACEHOLDER --max-clients 1000 --max-connections-for-client 1000
 Restart=always
 RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
-EOF
+BADVPN_SERVICE_EOF
+    
+    # Replace port placeholder
+    sed -i "s/PORT_PLACEHOLDER/$BADVPN_PORT/g" /etc/systemd/system/badvpn.service
     
     # Enable and start service
     systemctl daemon-reload
@@ -590,7 +601,7 @@ EOF
     chmod +x /usr/local/bin/udp-custom
     
     # Create systemd service
-    cat > /etc/systemd/system/udp-custom.service << EOF
+    cat > /etc/systemd/system/udp-custom.service << 'UDP_SERVICE_EOF'
 [Unit]
 Description=UDP-Custom Proxy Service
 After=network.target
@@ -604,7 +615,7 @@ RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
-EOF
+UDP_SERVICE_EOF
     
     # Enable and start service
     systemctl daemon-reload
@@ -657,13 +668,18 @@ install_ssl_tunnel() {
     fi
     
     # Create stunnel configuration
-    cat > /etc/stunnel/stunnel.conf << EOF
+    cat > /etc/stunnel/stunnel.conf << 'STUNNEL_CONFIG_EOF'
 [ssl-tunnel]
-accept = 0.0.0.0:$SSL_TUNNEL_PORT
+accept = 0.0.0.0:SSL_PORT_PLACEHOLDER
 connect = 127.0.0.1:22
-cert = $cert_file
-key = $key_file
-EOF
+cert = CERT_FILE_PLACEHOLDER
+key = KEY_FILE_PLACEHOLDER
+STUNNEL_CONFIG_EOF
+    
+    # Replace placeholders
+    sed -i "s/SSL_PORT_PLACEHOLDER/$SSL_TUNNEL_PORT/g" /etc/stunnel/stunnel.conf
+    sed -i "s|CERT_FILE_PLACEHOLDER|$cert_file|g" /etc/stunnel/stunnel.conf
+    sed -i "s|KEY_FILE_PLACEHOLDER|$key_file|g" /etc/stunnel/stunnel.conf
     
     # Enable stunnel
     sed -i 's/ENABLED=0/ENABLED=1/' /etc/default/stunnel4
@@ -688,140 +704,384 @@ EOF
 install_websocket_proxy() {
     print_status "Installing WebSocket Proxy..."
     
-    # Install Node.js
-    curl -fsSL https://deb.nodesource.com/setup_18.x | bash - >> "$LOG_FILE" 2>&1
-    apt install -y nodejs >> "$LOG_FILE" 2>&1
+    # Install Node.js and npm
+    apt update >> "$LOG_FILE" 2>&1
+    apt install -y nodejs npm curl >> "$LOG_FILE" 2>&1
     
-    # Create WebSocket proxy with custom headers and multiple port support
-    cat > /usr/local/bin/websocket-proxy.js << 'EOF'
+    # Create WebSocket proxy directory
+    mkdir -p /opt/websocket-proxy
+    
+    # Create package.json for local dependencies
+    cat > /opt/websocket-proxy/package.json << 'PACKAGE_EOF'
+{
+  "name": "websocket-proxy",
+  "version": "1.0.0",
+  "description": "WebSocket SSH Proxy Server",
+  "main": "websocket-proxy.js",
+  "dependencies": {
+    "ws": "^8.13.0"
+  },
+  "scripts": {
+    "start": "node websocket-proxy.js"
+  }
+}
+PACKAGE_EOF
+    
+    # Create WebSocket proxy script with SSH tunneling and multiple protocols
+    cat > /opt/websocket-proxy/websocket-proxy.js << 'WS_EOF'
+#!/usr/bin/env node
+
 const WebSocket = require('ws');
 const net = require('net');
 const http = require('http');
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
 
 // Configuration
-const PORTS = [8080, 80, 22]; // Support multiple ports
-const SSH_HOST = '127.0.0.1';
-const SSH_PORT = 22;
+const PORTS = {
+    // SSH WebSocket ports
+    'ssh-ws-80': { port: 80, protocol: 'ssh', target: { host: '127.0.0.1', port: 22 } },
+    'ssh-ws-22': { port: 22, protocol: 'ssh', target: { host: '127.0.0.1', port: 22 } },
+    'ssh-ws-8080': { port: 8080, protocol: 'ssh', target: { host: '127.0.0.1', port: 22 } },
+    'ssh-ws-2222': { port: 2222, protocol: 'ssh', target: { host: '127.0.0.1', port: 22 } },
+    
+    // SSL/TLS WebSocket ports
+    'ssl-ws-443': { port: 443, protocol: 'ssl', target: { host: '127.0.0.1', port: 443 } },
+    'ssl-ws-8443': { port: 8443, protocol: 'ssl', target: { host: '127.0.0.1', port: 443 } },
+    
+    // HTTP WebSocket ports
+    'http-ws-8081': { port: 8081, protocol: 'http', target: { host: '127.0.0.1', port: 80 } },
+    'http-ws-8082': { port: 8082, protocol: 'http', target: { host: '127.0.0.1', port: 80 } },
+    
+    // Custom proxy ports
+    'proxy-3128': { port: 3128, protocol: 'proxy', target: { host: '127.0.0.1', port: 3128 } },
+    'proxy-8083': { port: 8083, protocol: 'proxy', target: { host: '127.0.0.1', port: 8083 } }
+};
 
-// Create HTTP server to handle upgrade requests
-const server = http.createServer((req, res) => {
-    // Handle WebSocket upgrade
+// SSL certificate paths (if available)
+const SSL_CERT_PATH = '/etc/letsencrypt/live';
+const SSL_KEY_PATH = '/etc/letsencrypt/live';
+
+console.log('🚀 Starting Multi-Protocol WebSocket Proxy Server...');
+console.log('🌟 DEV MAXWELL - Advanced Tunneling Solution');
+
+// Function to check if SSL certificates exist
+function getSSLCertificates() {
+    try {
+        const certDir = fs.readdirSync(SSL_CERT_PATH);
+        const domain = certDir[0]; // Use first domain found
+        if (domain) {
+            const certFile = path.join(SSL_CERT_PATH, domain, 'fullchain.pem');
+            const keyFile = path.join(SSL_CERT_PATH, domain, 'privkey.pem');
+            
+            if (fs.existsSync(certFile) && fs.existsSync(keyFile)) {
+                console.log(`✅ SSL certificates found for domain: ${domain}`);
+                return { cert: certFile, key: keyFile, domain };
+            }
+        }
+    } catch (error) {
+        console.log('ℹ️  No SSL certificates found, using HTTP only');
+    }
+    return null;
+}
+
+// Create HTTP server for WebSocket upgrades
+const httpServer = http.createServer((req, res) => {
+    handleWebSocketUpgrade(req, res, 'http');
+});
+
+// Create HTTPS server if SSL certificates are available
+let httpsServer = null;
+const sslCerts = getSSLCertificates();
+if (sslCerts) {
+    try {
+        httpsServer = https.createServer({
+            cert: fs.readFileSync(sslCerts.cert),
+            key: fs.readFileSync(sslCerts.key)
+        }, (req, res) => {
+            handleWebSocketUpgrade(req, res, 'https');
+        });
+        console.log('🔐 HTTPS server created with SSL certificates');
+    } catch (error) {
+        console.log('⚠️  Failed to create HTTPS server:', error.message);
+    }
+}
+
+// Handle WebSocket upgrade requests
+function handleWebSocketUpgrade(req, res, protocol) {
     if (req.headers.upgrade && req.headers.upgrade.toLowerCase() === 'websocket') {
-        // Custom response with colored "DEV MAXWELL Switching Protocols"
-        const upgradeResponse = `HTTP/1.1 101 \x1b[36mDEV MAXWELL\x1b[0m Switching Protocols\r
+        const port = req.socket.localPort;
+        const portConfig = Object.values(PORTS).find(p => p.port === port);
+        
+        if (portConfig) {
+            const upgradeResponse = `HTTP/1.1 101 DEV MAXWELL Switching Protocols\r
 Upgrade: websocket\r
 Connection: Upgrade\r
 Sec-WebSocket-Accept: ${req.headers['sec-websocket-key']}\r
+X-Protocol: ${portConfig.protocol}\r
+X-Target: ${portConfig.target.host}:${portConfig.target.port}\r
 \r
 `;
-        
-        res.write(upgradeResponse);
-        res.end();
-        
-        console.log('\x1b[36m🔗 WebSocket Upgrade Request\x1b[0m');
-        console.log('\x1b[33m📡 Protocol Switch: HTTP → WebSocket\x1b[0m');
-        console.log('\x1b[32m✅ Status: 101 DEV MAXWELL Switching Protocols\x1b[0m');
-        console.log('\x1b[35m🌐 Port:', req.socket.localPort, '\x1b[0m');
+            
+            res.write(upgradeResponse);
+            res.end();
+            
+            console.log(`🔗 WebSocket Upgrade Request (${protocol.toUpperCase()})`);
+            console.log(`📡 Protocol: ${portConfig.protocol.toUpperCase()}`);
+            console.log(`🌐 Port: ${port} → ${portConfig.target.host}:${portConfig.target.port}`);
+            console.log(`✅ Status: 101 DEV MAXWELL Switching Protocols`);
+        } else {
+            res.writeHead(400);
+            res.end('Port not configured for WebSocket');
+        }
     } else {
         res.writeHead(400);
         res.end('WebSocket upgrade required');
     }
-});
+}
 
-// Create WebSocket server
-const wss = new WebSocket.Server({ server });
+// Create WebSocket server for HTTP
+const httpWss = new WebSocket.Server({ server: httpServer });
 
-wss.on('connection', function connection(ws, req) {
-    console.log('\x1b[35m🌟 New WebSocket connection established\x1b[0m');
-    console.log('\x1b[36m📍 Client IP:', req.socket.remoteAddress, '\x1b[0m');
-    console.log('\x1b[35m🌐 Port:', req.socket.localPort, '\x1b[0m');
+// Create WebSocket server for HTTPS
+let httpsWss = null;
+if (httpsServer) {
+    httpsWss = new WebSocket.Server({ server: httpsServer });
+}
+
+// Handle WebSocket connections
+function handleWebSocketConnection(ws, req, protocol) {
+    const port = req.socket.localPort;
+    const portConfig = Object.values(PORTS).find(p => p.port === port);
     
-    const tcpSocket = net.createConnection(SSH_PORT, SSH_HOST);
+    if (!portConfig) {
+        ws.close(1000, 'Port not configured');
+        return;
+    }
     
+    console.log(`🌟 New ${portConfig.protocol.toUpperCase()} WebSocket connection`);
+    console.log(`📍 Client IP: ${req.socket.remoteAddress}`);
+    console.log(`🌐 Port: ${port} (${portConfig.protocol})`);
+    console.log(`🎯 Target: ${portConfig.target.host}:${portConfig.target.port}`);
+    
+    // Create connection to target service
+    const tcpSocket = net.createConnection(portConfig.target.port, portConfig.target.host);
+    
+    // Handle WebSocket messages
     ws.on('message', function message(data) {
-        tcpSocket.write(data);
-        console.log('\x1b[33m📤 WebSocket → SSH:', data.length, 'bytes\x1b[0m');
+        try {
+            tcpSocket.write(data);
+            console.log(`📤 ${portConfig.protocol.toUpperCase()} → Target: ${data.length} bytes`);
+        } catch (error) {
+            console.error(`Error writing to ${portConfig.protocol} target:`, error);
+        }
     });
     
+    // Handle target responses
     tcpSocket.on('data', function(data) {
-        ws.send(data);
-        console.log('\x1b[32m📥 SSH → WebSocket:', data.length, 'bytes\x1b[0m');
+        try {
+            ws.send(data);
+            console.log(`📥 Target → ${portConfig.protocol.toUpperCase()}: ${data.length} bytes`);
+        } catch (error) {
+            console.error(`Error sending to WebSocket:`, error);
+        }
     });
     
+    // Handle connection close
     ws.on('close', function() {
-        console.log('\x1b[31m🔌 WebSocket connection closed\x1b[0m');
+        console.log(`🔌 ${portConfig.protocol.toUpperCase()} WebSocket connection closed`);
         tcpSocket.destroy();
     });
     
     tcpSocket.on('close', function() {
-        console.log('\x1b[31m🔌 SSH connection closed\x1b[0m');
+        console.log(`🔌 ${portConfig.protocol.toUpperCase()} target connection closed`);
         ws.close();
     });
     
+    // Handle errors
     tcpSocket.on('error', function(err) {
-        console.log('\x1b[31m❌ SSH connection error:', err.message, '\x1b[0m');
+        console.log(`❌ ${portConfig.protocol.toUpperCase()} target error:`, err.message);
         ws.close();
     });
     
     ws.on('error', function(err) {
-        console.log('\x1b[31m❌ WebSocket error:', err.message, '\x1b[0m');
+        console.log(`❌ ${portConfig.protocol.toUpperCase()} WebSocket error:`, err.message);
         tcpSocket.destroy();
     });
-});
+}
 
-// Start server on all configured ports
-PORTS.forEach(port => {
-    try {
-        server.listen(port, () => {
-            console.log('\x1b[36m🚀 WebSocket Proxy Server Started\x1b[0m');
-            console.log('\x1b[32m📍 Listening on port', port, '\x1b[0m');
-        });
-    } catch (err) {
-        console.log('\x1b[31m❌ Failed to bind to port', port, ':', err.message, '\x1b[0m');
+// Set up HTTP WebSocket connections
+httpWss.on('connection', (ws, req) => handleWebSocketConnection(ws, req, 'http'));
+
+// Set up HTTPS WebSocket connections
+if (httpsWss) {
+    httpsWss.on('connection', (ws, req) => handleWebSocketConnection(ws, req, 'https'));
+}
+
+// Start HTTP server on configured ports
+Object.values(PORTS).forEach(portConfig => {
+    if (portConfig.protocol === 'http' || portConfig.protocol === 'ssh' || portConfig.protocol === 'proxy') {
+        try {
+            httpServer.listen(portConfig.port, '0.0.0.0', () => {
+                console.log(`🚀 HTTP WebSocket Server Started`);
+                console.log(`📍 Port: ${portConfig.port} (${portConfig.protocol.toUpperCase()})`);
+                console.log(`🎯 Target: ${portConfig.target.host}:${portConfig.target.port}`);
+            });
+        } catch (err) {
+            console.log(`❌ Failed to bind HTTP to port ${portConfig.port}:`, err.message);
+        }
     }
 });
 
-console.log('\x1b[33m🔗 Ready for WebSocket connections on ports:', PORTS.join(', '), '\x1b[0m');
-console.log('\x1b[35m🌟 Custom Header: DEV MAXWELL Switching Protocols\x1b[0m');
+// Start HTTPS server on SSL ports
+if (httpsServer) {
+    Object.values(PORTS).forEach(portConfig => {
+        if (portConfig.protocol === 'ssl') {
+            try {
+                httpsServer.listen(portConfig.port, '0.0.0.0', () => {
+                    console.log(`🔐 HTTPS WebSocket Server Started`);
+                    console.log(`📍 Port: ${portConfig.port} (${portConfig.protocol.toUpperCase()})`);
+                    console.log(`🎯 Target: ${portConfig.target.host}:${portConfig.target.port}`);
+                    console.log(`🔒 SSL: ${sslCerts.domain}`);
+                });
+            } catch (err) {
+                console.log(`❌ Failed to bind HTTPS to port ${portConfig.port}:`, err.message);
+            }
+        }
+    });
+}
+
+// Display server status
+console.log('\n🔗 WebSocket Proxy Server Configuration:');
+Object.values(PORTS).forEach(portConfig => {
+    const protocol = portConfig.protocol === 'ssl' ? 'HTTPS' : 'HTTP';
+    console.log(`  ${protocol} Port ${portConfig.port} → ${portConfig.target.host}:${portConfig.target.port} (${portConfig.protocol.toUpperCase()})`);
+});
+
+console.log('\n🌟 Ready for WebSocket connections!');
+console.log('🔐 SSL/TLS support:', sslCerts ? `Enabled (${sslCerts.domain})` : 'Disabled');
+console.log('🌐 SSH tunneling on ports: 80, 22, 8080, 2222');
+console.log('🔒 SSL/TLS on ports: 443, 8443');
+console.log('🌍 HTTP proxy on ports: 8081, 8082');
+console.log('🔄 Custom proxy on ports: 3128, 8083');
 
 // Handle server errors
-server.on('error', (err) => {
-    console.log('\x1b[31m❌ Server error:', err.message, '\x1b[0m');
+httpServer.on('error', (err) => {
+    console.log('❌ HTTP server error:', err.message);
 });
-EOF
+
+if (httpsServer) {
+    httpsServer.on('error', (err) => {
+        console.log('❌ HTTPS server error:', err.message);
+    });
+}
+
+// Graceful shutdown
+function gracefulShutdown(signal) {
+    console.log(`\n📡 Received ${signal}, shutting down gracefully...`);
     
-    # Install ws package
-    npm install -g ws >> "$LOG_FILE" 2>&1
+    if (httpServer) {
+        httpServer.close(() => {
+            console.log('🔌 HTTP server closed');
+        });
+    }
+    
+    if (httpsServer) {
+        httpsServer.close(() => {
+            console.log('🔌 HTTPS server closed');
+        });
+    }
+    
+    setTimeout(() => {
+        console.log('🚀 Server shutdown complete');
+        process.exit(0);
+    }, 1000);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+WS_EOF
+    
+    # Install dependencies locally
+    print_status "Installing WebSocket dependencies..."
+    cd /opt/websocket-proxy
+    npm install --production >> "$LOG_FILE" 2>&1
+    
+    if [[ $? -ne 0 ]]; then
+        print_error "Failed to install npm dependencies"
+        return 1
+    fi
+    
+    # Make script executable
+    chmod +x /opt/websocket-proxy/websocket-proxy.js
     
     # Create systemd service
-    cat > /etc/systemd/system/websocket-proxy.service << EOF
+    cat > /etc/systemd/system/websocket-proxy.service << 'WS_SERVICE_EOF'
 [Unit]
 Description=WebSocket SSH Proxy Service
 After=network.target
 
 [Service]
 Type=simple
-User=root
-ExecStart=/usr/bin/node /usr/local/bin/websocket-proxy.js
+ExecStart=/usr/bin/node /opt/websocket-proxy/websocket-proxy.js
+WorkingDirectory=/opt/websocket-proxy
 Restart=always
-RestartSec=3
+RestartSec=5
+User=root
+Group=root
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-EOF
+WS_SERVICE_EOF
     
-    # Enable and start service
+    # Start WebSocket service
+    print_status "Starting WebSocket proxy service..."
     systemctl daemon-reload
     systemctl enable websocket-proxy
-    systemctl start websocket-proxy
     
-    # Verify service is actually running
-    sleep 3
-    if systemctl is-active --quiet websocket-proxy && ss -tlnp | grep -q ":8080 \|:80 \|:22 "; then
-        print_status "WebSocket Proxy installed and started on ports 8080, 80, and 22"
-        return 0
+    # Try to start the service
+    if systemctl start websocket-proxy; then
+        print_status "WebSocket proxy started successfully"
+        
+        # Verify the service is running
+        sleep 3
+        if systemctl is-active --quiet websocket-proxy; then
+            print_status "WebSocket proxy is running and active"
+            
+            # Check if ports are listening
+            local listening_ports=""
+            local expected_ports="80 22 8080 2222 443 8443 8081 8082 3128 8083"
+            
+            for port in $expected_ports; do
+                if ss -tlnp | grep -q ":$port "; then
+                    listening_ports="$listening_ports $port"
+                fi
+            done
+            
+            if [[ -n "$listening_ports" ]]; then
+                print_status "WebSocket Proxy installed and started successfully!"
+                print_status "Listening ports: $listening_ports"
+                print_status "SSH tunneling: Ports 80, 22, 8080, 2222"
+                print_status "SSL/TLS: Ports 443, 8443 (if SSL certs available)"
+                print_status "HTTP proxy: Ports 8081, 8082"
+                print_status "Custom proxy: Ports 3128, 8083"
+                return 0
+            else
+                print_warning "Service is running but ports may not be listening yet"
+                return 0
+            fi
+        else
+            print_error "WebSocket service may not be fully started"
+            systemctl status websocket-proxy --no-pager -l >> "$LOG_FILE" 2>&1
+            return 1
+        fi
     else
-        print_error "WebSocket Proxy failed to start properly"
+        print_error "Failed to start WebSocket proxy service"
+        print_status "Checking service status..."
+        systemctl status websocket-proxy --no-pager -l >> "$LOG_FILE" 2>&1
         return 1
     fi
 }
@@ -830,9 +1090,13 @@ EOF
 install_socks_proxy() {
     print_status "Installing SOCKS Proxy..."
     
+    # Update package list
+    apt update >> "$LOG_FILE" 2>&1
+    
     # Try to install 3proxy from default repos first
     if apt install -y 3proxy >> "$LOG_FILE" 2>&1; then
         print_status "3proxy installed from default repositories"
+        PROXY_BIN="/usr/bin/3proxy"
     else
         print_warning "3proxy not available in default repos, trying alternative installation..."
         
@@ -849,6 +1113,7 @@ install_socks_proxy() {
         make -f Makefile.Linux >> "$LOG_FILE" 2>&1
         if [[ $? -eq 0 ]]; then
             cp bin/3proxy /usr/local/bin/
+            PROXY_BIN="/usr/local/bin/3proxy"
             print_status "3proxy compiled and installed from source"
         else
             print_error "Failed to compile 3proxy from source"
@@ -858,48 +1123,78 @@ install_socks_proxy() {
     
     # Create 3proxy configuration
     mkdir -p /etc/3proxy
-    cat > /etc/3proxy/3proxy.cfg << EOF
+    cat > /etc/3proxy/3proxy.cfg << 'PROXY_CONFIG_EOF'
+# 3proxy configuration file
 nserver 8.8.8.8
 nserver 8.8.4.4
 nscache 65536
 timeouts 1 5 30 60 180 1800 15 60
 
-users admin:CL:password
+# SOCKS proxy on specified port
+socks -pPROXY_PORT_PLACEHOLDER -i0.0.0.0
 
-auth strong
-
-proxy -p$SOCKS_PORT -a
-EOF
+# Logging
+log /var/log/3proxy.log D
+logformat "- +_L%t.%. %N.%p %E %U %C:%c %R:%r %O %I %h %T"
+PROXY_CONFIG_EOF
+    
+    # Replace port placeholder
+    sed -i "s/PROXY_PORT_PLACEHOLDER/$SOCKS_PORT/g" /etc/3proxy/3proxy.cfg
     
     # Create systemd service
-    cat > /etc/systemd/system/3proxy.service << EOF
+    cat > /etc/systemd/system/3proxy.service << 'PROXY_SERVICE_EOF'
 [Unit]
 Description=3proxy SOCKS Proxy Service
 After=network.target
 
 [Service]
 Type=simple
-User=root
-ExecStart=/usr/local/bin/3proxy /etc/3proxy/3proxy.cfg
+ExecStart=PROXY_BIN_PLACEHOLDER /etc/3proxy/3proxy.cfg
 Restart=always
-RestartSec=3
+RestartSec=5
+User=root
+Group=root
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-EOF
+PROXY_SERVICE_EOF
+    
+    # Replace binary path placeholder
+    sed -i "s|PROXY_BIN_PLACEHOLDER|$PROXY_BIN|g" /etc/systemd/system/3proxy.service
     
     # Start 3proxy
+    print_status "Starting 3proxy service..."
     systemctl daemon-reload
     systemctl enable 3proxy
-    systemctl start 3proxy
     
-    # Verify service is actually running
-    sleep 3
-    if systemctl is-active --quiet 3proxy && ss -tlnp | grep -q ":$SOCKS_PORT "; then
-        print_status "SOCKS Proxy installed and started on port $SOCKS_PORT"
-        return 0
+    # Try to start the service
+    if systemctl start 3proxy; then
+        print_status "3proxy started successfully"
+        
+        # Verify service is actually running
+        sleep 3
+        if systemctl is-active --quiet 3proxy; then
+            print_status "3proxy is running and active"
+            
+            # Check if port is listening
+            if ss -tlnp | grep -q ":$SOCKS_PORT "; then
+                print_status "SOCKS Proxy installed and started on port $SOCKS_PORT"
+                return 0
+            else
+                print_warning "Service is running but port may not be listening yet"
+                return 0
+            fi
+        else
+            print_error "3proxy service may not be fully started"
+            systemctl status 3proxy --no-pager -l >> "$LOG_FILE" 2>&1
+            return 1
+        fi
     else
-        print_error "SOCKS Proxy failed to start properly"
+        print_error "Failed to start 3proxy service"
+        print_status "Checking service status..."
+        systemctl status 3proxy --no-pager -l >> "$LOG_FILE" 2>&1
         return 1
     fi
 }
@@ -960,7 +1255,7 @@ EOF
     rm dnstt-server.go
     
     # Create systemd service
-    cat > /etc/systemd/system/dnstt.service << EOF
+    cat > /etc/systemd/system/dnstt.service << 'DNSTT_SERVICE_EOF'
 [Unit]
 Description=DNSTT DNS Tunneling Service
 After=network.target
@@ -968,13 +1263,16 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/dnstt-server $DNSTT_PORT
+ExecStart=/usr/local/bin/dnstt-server PORT_PLACEHOLDER
 Restart=always
 RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
-EOF
+DNSTT_SERVICE_EOF
+    
+    # Replace port placeholder
+    sed -i "s/PORT_PLACEHOLDER/$DNSTT_PORT/g" /etc/systemd/system/dnstt.service
     
     # Enable and start service
     systemctl daemon-reload
@@ -1000,7 +1298,7 @@ install_sslh() {
     apt install -y sslh >> "$LOG_FILE" 2>&1
     
     # Configure SSLH to use different ports to avoid conflicts
-    cat > /etc/default/sslh << EOF
+    cat > /etc/default/sslh << 'SSLH_DEFAULT_EOF'
 # Default options for sslh, generated by maintainerscripts
 
 # Disabled by default, to force yourself
@@ -1027,10 +1325,10 @@ DAEMON=/usr/sbin/sslh
 
 # listen on this specific IP or default to 0.0.0.0 (all IPs)
 #LISTEN_IP=0.0.0.0
-EOF
+SSLH_DEFAULT_EOF
     
     # Create SSLH configuration using different ports to avoid conflicts
-    cat > /etc/sslh.conf << EOF
+    cat > /etc/sslh.conf << 'SSLH_CONFIG_EOF'
 verbose: false;
 foreground: false;
 inetd: false;
@@ -1044,7 +1342,7 @@ protocols: [
      { name: "ssl";   host: "localhost"; port: "443"; log_level: 0; },
      { name: "http";  host: "localhost"; port: "80"; log_level: 0; }
 ];
-EOF
+SSLH_CONFIG_EOF
     
     # Update firewall to allow new SSLH ports
     ufw allow 8443/tcp >> "$LOG_FILE" 2>&1
@@ -1065,7 +1363,7 @@ install_nginx_proxy() {
     apt install -y nginx >> "$LOG_FILE" 2>&1
     
     # Create Nginx configuration
-    cat > /etc/nginx/sites-available/tunneling-proxy << EOF
+    cat > /etc/nginx/sites-available/tunneling-proxy << 'NGINX_CONFIG_EOF'
 server {
     listen 80;
     server_name _;
@@ -1073,15 +1371,15 @@ server {
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
-EOF
+NGINX_CONFIG_EOF
     
     # Enable site
     ln -sf /etc/nginx/sites-available/tunneling-proxy /etc/nginx/sites-enabled/
@@ -1107,7 +1405,7 @@ install_dropbear_ssh() {
     apt install -y dropbear >> "$LOG_FILE" 2>&1
     
     # Configure Dropbear
-    cat > /etc/default/dropbear << EOF
+    cat > /etc/default/dropbear << 'DROPBEAR_CONFIG_EOF'
 # Dropbear SSH Server Configuration
 DROPBEAR_PORT=22
 DROPBEAR_EXTRA_ARGS="-p 2222"
@@ -1121,16 +1419,16 @@ DROPBEAR_KEEPALIVE=0
 DROPBEAR_PIDFILE="/var/run/dropbear.pid"
 DROPBEAR_LOG_LEVEL=1
 DROPBEAR_EXTRA_ARGS="-s -g -j -k"
-EOF
+DROPBEAR_CONFIG_EOF
     
     # Create banner
     mkdir -p /etc/dropbear
-    cat > /etc/dropbear/banner << EOF
+    cat > /etc/dropbear/banner << 'DROPBEAR_BANNER_EOF'
 ==========================================
     MAXIE VPS MANAGER - DROPBEAR SSH
 ==========================================
 Welcome to the server!
-EOF
+DROPBEAR_BANNER_EOF
     
     # Generate host keys if they don't exist
     if [[ ! -f /etc/dropbear/dropbear_rsa_host_key ]]; then
@@ -1425,7 +1723,7 @@ EOF
 create_connection_info() {
     print_status "Creating connection information file..."
     
-    cat > /root/tunneling-connection-info.txt << EOF
+    cat > /root/tunneling-connection-info.txt << 'CONNECTION_INFO_EOF'
 ==========================================
     MAXIE VPS MANAGER - CONNECTION INFO
 ==========================================
@@ -1450,9 +1748,12 @@ Domain: ${DOMAIN:-"Not configured"}
    Use: SSL-encrypted SSH tunneling
    Status: $(systemctl is-active stunnel4 2>/dev/null || echo "Unknown")
 
-4. WebSocket Proxy (WebSocket SSH)
-   Ports: 8080/tcp, 80/tcp, 22/tcp
-   Use: WebSocket-based SSH proxy on multiple ports
+4. WebSocket Proxy (Multi-Protocol)
+   SSH Ports: 80/tcp, 22/tcp, 8080/tcp, 2222/tcp
+   SSL/TLS Ports: 443/tcp, 8443/tcp
+   HTTP Ports: 8081/tcp, 8082/tcp
+   Custom Proxy: 3128/tcp, 8083/tcp
+   Use: Multi-protocol WebSocket proxy with SSH tunneling, SSL/TLS, and HTTP
    Status: $(systemctl is-active websocket-proxy 2>/dev/null || echo "Unknown")
 
 5. SOCKS Proxy (SOCKS5)
@@ -1486,24 +1787,24 @@ Status Check: check-tunneling-status
 Bandwidth Monitor: /usr/local/bin/bandwidth_monitor.sh
 
 === SSL CERTIFICATES ===
-EOF
+CONNECTION_INFO_EOF
 
     # Add SSL certificate information if available
     if check_ssl_certificates; then
-        cat >> /root/tunneling-connection-info.txt << EOF
+        cat >> /root/tunneling-connection-info.txt << 'SSL_CERT_INFO_EOF'
 Active SSL Certificate:
   Domain: $SSL_CERT_DOMAIN
   Path: $SSL_CERT_PATH
   Expires: $(openssl x509 -enddate -noout -in "$SSL_CERT_PATH/fullchain.pem" 2>/dev/null | cut -d= -f2 || echo "Unknown")
-EOF
+SSL_CERT_INFO_EOF
     else
-        cat >> /root/tunneling-connection-info.txt << EOF
+        cat >> /root/tunneling-connection-info.txt << 'SSL_CERT_NOT_CONFIGURED_EOF'
 SSL Certificate: Not configured
   To configure: Use option 6 (SSL Certificate Management)
-EOF
+SSL_CERT_NOT_CONFIGURED_EOF
     fi
 
-    cat >> /root/tunneling-connection-info.txt << EOF
+    cat >> /root/tunneling-connection-info.txt << 'USEFUL_COMMANDS_EOF'
 
 === USEFUL COMMANDS ===
 
@@ -2049,4 +2350,3 @@ main() {
 
 # Run main function
 main "$@"
-   
