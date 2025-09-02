@@ -286,7 +286,7 @@ request_ssl_certificate() {
     sleep 3
     
     # Check if ports are free
-    if netstat -tlnp 2>/dev/null | grep -q ":80 "; then
+    if ss -tlnp 2>/dev/null | grep -q ":80 "; then
         print_error "Port 80 is still in use. Cannot proceed with SSL certificate request."
         print_error "Please stop the service using port 80 manually and try again."
         return 1
@@ -330,7 +330,7 @@ check_port_conflicts() {
     print_status "Checking port $port for conflicts..."
     
     # Check if port is already in use
-    local conflicting_service=$(netstat -tlnp 2>/dev/null | grep ":$port " | awk '{print $7}' | cut -d'/' -f2)
+    local conflicting_service=$(ss -tlnp 2>/dev/null | grep ":$port " | awk '{print $NF}' | cut -d'/' -f2)
     
     if [[ -n "$conflicting_service" ]]; then
         print_warning "Port $port is already in use by: $conflicting_service"
@@ -352,7 +352,7 @@ check_port_conflicts() {
                 sleep 2
                 
                 # Check if port is now free
-                if ! netstat -tlnp 2>/dev/null | grep -q ":$port "; then
+                if ! ss -tlnp 2>/dev/null | grep -q ":$port "; then
                     print_status "Port $port is now free"
                     return 0
                 else
@@ -522,7 +522,7 @@ EOF
     
     # Verify service is actually running
     sleep 3
-    if systemctl is-active --quiet badvpn && netstat -tlnp | grep -q ":$BADVPN_PORT"; then
+    if systemctl is-active --quiet badvpn && ss -tlnp | grep -q ":$BADVPN_PORT "; then
         print_status "BadVPN installed and started on port $BADVPN_PORT"
         return 0
     else
@@ -613,7 +613,7 @@ EOF
     
     # Verify service is actually running
     sleep 3
-    if systemctl is-active --quiet udp-custom && netstat -tlnp | grep -q ":$UDP_CUSTOM_PORT"; then
+    if systemctl is-active --quiet udp-custom && ss -tlnp | grep -q ":$UDP_CUSTOM_PORT "; then
         print_status "UDP-Custom installed and started on port $UDP_CUSTOM_PORT"
         return 0
     else
@@ -674,7 +674,7 @@ EOF
     
     # Verify service is actually running
     sleep 3
-    if systemctl is-active --quiet stunnel4 && netstat -tlnp | grep -q ":$SSL_TUNNEL_PORT "; then
+    if systemctl is-active --quiet stunnel4 && ss -tlnp | grep -q ":$SSL_TUNNEL_PORT "; then
         print_status "SSL Tunnel installed and started on port $SSL_TUNNEL_PORT"
         print_status "Certificate: ${cert_file:-"Self-signed"}"
         return 0
@@ -817,7 +817,7 @@ EOF
     
     # Verify service is actually running
     sleep 3
-    if systemctl is-active --quiet websocket-proxy && netstat -tlnp | grep -q ":8080 \|:80 \|:22 "; then
+    if systemctl is-active --quiet websocket-proxy && ss -tlnp | grep -q ":8080 \|:80 \|:22 "; then
         print_status "WebSocket Proxy installed and started on ports 8080, 80, and 22"
         return 0
     else
@@ -895,7 +895,7 @@ EOF
     
     # Verify service is actually running
     sleep 3
-    if systemctl is-active --quiet 3proxy && netstat -tlnp | grep -q ":$SOCKS_PORT "; then
+    if systemctl is-active --quiet 3proxy && ss -tlnp | grep -q ":$SOCKS_PORT "; then
         print_status "SOCKS Proxy installed and started on port $SOCKS_PORT"
         return 0
     else
@@ -983,7 +983,7 @@ EOF
     
     # Verify service is actually running
     sleep 3
-    if systemctl is-active --quiet dnstt && netstat -tlnp | grep -q ":$DNSTT_PORT"; then
+    if systemctl is-active --quiet dnstt && ss -tlnp | grep -q ":$DNSTT_PORT "; then
         print_status "DNSTT installed and started on port $DNSTT_PORT"
         return 0
     else
@@ -1149,14 +1149,34 @@ EOF
     systemctl enable dropbear
     systemctl start dropbear
     
+    # Wait for service to start
+    sleep 5
+    
     # Verify service is actually running
-    sleep 3
-    if systemctl is-active --quiet dropbear && netstat -tlnp | grep -q ":22 "; then
-        print_status "Dropbear SSH installed and started on port 22"
-        print_status "Additional port 2222 also available"
-        return 0
+    if systemctl is-active --quiet dropbear; then
+        print_status "Dropbear SSH service is active"
+        
+        # Check if it's listening on port 22 using ss (modern replacement for netstat)
+        if ss -tlnp 2>/dev/null | grep -q ":22 "; then
+            print_status "Dropbear SSH installed and started on port 22"
+            print_status "Additional port 2222 also available"
+            return 0
+        else
+            print_warning "Dropbear service is active but not listening on port 22"
+            print_status "Checking for alternative ports..."
+            
+            # Check if it's listening on any SSH-related ports
+            if ss -tlnp 2>/dev/null | grep -q "dropbear"; then
+                local ports=$(ss -tlnp 2>/dev/null | grep "dropbear" | grep -o ":[0-9]*" | tr '\n' ' ')
+                print_status "Dropbear is listening on ports: $ports"
+                return 0
+            else
+                print_error "Dropbear is not listening on any ports"
+                return 1
+            fi
+        fi
     else
-        print_error "Dropbear SSH failed to start properly"
+        print_error "Dropbear SSH service failed to start"
         return 1
     fi
 }
@@ -1353,12 +1373,12 @@ fi
 
 echo
 echo "=== Detailed Port Status ==="
-netstat -tlnp 2>/dev/null | grep -E ":(7300|5300|444|8080|200|53|80|443|8443|8081|22)" | sort | while read line; do
-    port=$(echo "$line" | grep -o ":[0-9]*" | head -1 | cut -d: -f2)
-    service=$(echo "$line" | awk '{print $7}' | cut -d'/' -f2)
-    pid=$(echo "$line" | awk '{print $7}' | cut -d'/' -f1)
+ss -tlnp 2>/dev/null | grep -E ":(7300|5300|444|8080|200|53|80|443|8443|8081|22)" | sort | while read line; do
+    local port=$(echo "$line" | grep -o ":[0-9]*" | head -1 | cut -d: -f2)
+    local service=$(echo "$line" | awk '{print $NF}' | cut -d'/' -f2)
+    local pid=$(echo "$line" | awk '{print $NF}' | cut -d'/' -f1)
     echo "  Port $port: $service (PID: $pid)"
-done || echo "netstat not available"
+done || echo "ss command not available"
 
 echo
 echo "=== Firewall Status ==="
@@ -1520,7 +1540,7 @@ SSL Certificate Management:
 For issues and support, check:
 - Service logs: journalctl -u [service-name]
 - Firewall status: ufw status
-- Port status: netstat -tlnp
+- Port status: ss -tlnp
 - Bandwidth usage: /usr/local/bin/bandwidth_monitor.sh status
 
 Generated on: $(date)
@@ -1721,7 +1741,7 @@ check_service_status() {
         local listening_ports=""
         
         for p in "${ports[@]}"; do
-            if netstat -tlnp 2>/dev/null | grep -q ":$p "; then
+            if ss -tlnp 2>/dev/null | grep -q ":$p "; then
                 port_listening=true
                 listening_ports="$listening_ports $p"
             fi
@@ -1883,12 +1903,12 @@ check_all_services_status() {
     
     echo
     echo "=== Detailed Port Status ==="
-    netstat -tlnp 2>/dev/null | grep -E ":(7300|5300|444|8080|200|53|80|443|8443|8081|22)" | sort | while read line; do
+    ss -tlnp 2>/dev/null | grep -E ":(7300|5300|444|8080|200|53|80|443|8443|8081|22)" | sort | while read line; do
         local port=$(echo "$line" | grep -o ":[0-9]*" | head -1 | cut -d: -f2)
-        local service=$(echo "$line" | awk '{print $7}' | cut -d'/' -f2)
-        local pid=$(echo "$line" | awk '{print $7}' | cut -d'/' -f1)
+        local service=$(echo "$line" | awk '{print $NF}' | cut -d'/' -f2)
+        local pid=$(echo "$line" | awk '{print $NF}' | cut -d'/' -f1)
         echo "  Port $port: $service (PID: $pid)"
-    done || echo "netstat not available"
+    done || echo "ss command not available"
     
     echo
     echo "=== Firewall Status ==="
