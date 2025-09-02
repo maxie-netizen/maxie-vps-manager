@@ -106,8 +106,8 @@ check_system() {
 update_system() {
     print_status "Updating system packages..."
     apt update -y >> "$LOG_FILE" 2>&1
-    apt install -y curl wget git ufw iptables-persistent >> "$LOG_FILE" 2>&1
-    print_status "System updated successfully"
+    apt install -y curl wget git ufw >> "$LOG_FILE" 2>&1
+    print_status "System updated successfully (upgrade skipped to avoid VM slowdown)"
 }
 
 # Function to configure firewall
@@ -142,124 +142,66 @@ configure_firewall() {
     fi
 }
 
-# Function to setup bandwidth monitoring
-setup_bandwidth_monitoring() {
-    print_status "Setting up bandwidth monitoring..."
-    
-    # Create bandwidth monitoring script
-    cat > /usr/local/bin/bandwidth-monitor.sh << 'EOF'
-#!/bin/bash
-
-# Bandwidth monitoring script using iptables
-LOG_FILE="/var/log/bandwidth.log"
-RESET_TIME="00:00"
-
-# Create iptables chains if they don't exist
-iptables -t mangle -N BANDWIDTH_IN 2>/dev/null
-iptables -t mangle -N BANDWIDTH_OUT 2>/dev/null
-
-# Clear existing rules
-iptables -t mangle -F BANDWIDTH_IN
-iptables -t mangle -F BANDWIDTH_OUT
-
-# Add rules for each user (you can modify this list)
-USERS=("user1" "user2" "user3")
-
-for user in "${USERS[@]}"; do
-    # Create user-specific chains
-    iptables -t mangle -N BANDWIDTH_${user^^}_IN 2>/dev/null
-    iptables -t mangle -N BANDWIDTH_${user^^}_OUT 2>/dev/null
-    
-    # Clear existing rules
-    iptables -t mangle -F BANDWIDTH_${user^^}_IN
-    iptables -t mangle -F BANDWIDTH_${user^^}_OUT
-    
-    # Add user to main chains
-    iptables -t mangle -A BANDWIDTH_IN -m owner --uid-owner $(id -u $user 2>/dev/null || echo 1000) -j BANDWIDTH_${user^^}_IN
-    iptables -t mangle -A BANDWIDTH_OUT -m owner --uid-owner $(id -u $user 2>/dev/null || echo 1000) -j BANDWIDTH_${user^^}_OUT
-    
-    # Add counting rules
-    iptables -t mangle -A BANDWIDTH_${user^^}_IN -j RETURN
-    iptables -t mangle -A BANDWIDTH_${user^^}_OUT -j RETURN
-done
-
-# Hook into INPUT and OUTPUT chains
-iptables -t mangle -A INPUT -j BANDWIDTH_IN
-iptables -t mangle -A OUTPUT -j BANDWIDTH_OUT
-
-# Save iptables rules
-iptables-save > /etc/iptables/rules.v4
-
-echo "$(date): Bandwidth monitoring initialized" >> "$LOG_FILE"
-EOF
-    
-    chmod +x /usr/local/bin/bandwidth-monitor.sh
-    
-    # Create daily reset script
-    cat > /usr/local/bin/bandwidth-reset.sh << 'EOF'
-#!/bin/bash
-
-# Daily bandwidth reset script
-LOG_FILE="/var/log/bandwidth.log"
-RESET_TIME="00:00"
-
-# Reset iptables counters
-iptables -t mangle -Z
-
-# Log reset
-echo "$(date): Daily bandwidth counters reset" >> "$LOG_FILE"
-
-# Save current bandwidth stats before reset
-echo "$(date): === DAILY BANDWIDTH SUMMARY ===" >> "$LOG_FILE"
-iptables -t mangle -L -v -x | grep -E "BANDWIDTH_.*_IN|BANDWIDTH_.*_OUT" >> "$LOG_FILE"
-echo "$(date): === END SUMMARY ===" >> "$LOG_FILE"
-EOF
-    
-    chmod +x /usr/local/bin/bandwidth-reset.sh
-    
-    # Setup cron job for daily reset at midnight Africa/Nairobi timezone
-    (crontab -l 2>/dev/null; echo "0 0 * * * /usr/local/bin/bandwidth-reset.sh") | crontab -
-    
-    # Initialize bandwidth monitoring
-    /usr/local/bin/bandwidth-monitor.sh
-    
-    print_status "Bandwidth monitoring setup completed"
-}
-
 # Function to check SSL certificates
 check_ssl_certificates() {
     print_status "Checking SSL certificates..."
     
     # Check for existing certificates
-    if [[ -f /etc/letsencrypt/live/*/fullchain.pem ]] || [[ -f /etc/ssl/certs/*.crt ]]; then
-        print_status "Existing SSL certificates found"
-        
-        # Find certificate paths
-        if [[ -f /etc/letsencrypt/live/*/fullchain.pem ]]; then
-            CERT_PATH=$(find /etc/letsencrypt/live/*/fullchain.pem | head -1)
-            KEY_PATH=$(find /etc/letsencrypt/live/*/privkey.pem | head -1)
-            print_status "Let's Encrypt certificate found: $CERT_PATH"
-        elif [[ -f /etc/ssl/certs/*.crt ]]; then
-            CERT_PATH=$(find /etc/ssl/certs/*.crt | head -1)
-            KEY_PATH=$(find /etc/ssl/private/*.key | head -1)
-            print_status "SSL certificate found: $CERT_PATH"
+    local cert_paths=(
+        "/etc/letsencrypt/live"
+        "/etc/ssl/certs"
+        "/etc/ssl/private"
+        "/root/.acme.sh"
+    )
+    
+    local cert_found=false
+    local cert_path=""
+    
+    for path in "${cert_paths[@]}"; do
+        if [[ -d "$path" ]]; then
+            # Look for certificate files
+            if find "$path" -name "*.crt" -o -name "*.pem" -o -name "*.key" 2>/dev/null | grep -q .; then
+                cert_found=true
+                cert_path="$path"
+                break
+            fi
         fi
+    done
+    
+    if [[ "$cert_found" == true ]]; then
+        print_status "SSL certificates found in: $cert_path"
         
-        return 0
-    else
-        print_warning "No SSL certificates found"
-        return 1
+        # Check certificate validity
+        local cert_file=$(find "$cert_path" -name "*.crt" -o -name "*.pem" 2>/dev/null | head -1)
+        if [[ -n "$cert_file" ]]; then
+            local expiry=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2)
+            if [[ -n "$expiry" ]]; then
+                print_status "Certificate expires: $expiry"
+                
+                # Check if certificate is valid
+                if openssl x509 -checkend 86400 -noout -in "$cert_file" >/dev/null 2>&1; then
+                    print_status "Certificate is valid and not expiring soon"
+                    return 0
+                else
+                    print_warning "Certificate is expired or expiring soon"
+                    return 1
+                fi
+            fi
+        fi
     fi
+    
+    print_warning "No valid SSL certificates found"
+    return 1
 }
 
 # Function to request SSL certificate
 request_ssl_certificate() {
+    print_status "Requesting SSL certificate..."
+    
     if [[ -z "$DOMAIN" || -z "$EMAIL" ]]; then
-        print_warning "Domain or email not provided. SSL certificate not requested."
+        print_error "Domain and email required for SSL certificate"
         return 1
     fi
-    
-    print_status "Requesting SSL certificate for domain: $DOMAIN"
     
     # Install Certbot
     apt install -y certbot python3-certbot-nginx >> "$LOG_FILE" 2>&1
@@ -271,21 +213,114 @@ request_ssl_certificate() {
     fi
     
     # Request certificate
-    certbot certonly --standalone -d "$DOMAIN" --email "$EMAIL" --agree-tos --non-interactive >> "$LOG_FILE" 2>&1
-    
-    if [[ $? -eq 0 ]]; then
+    print_status "Requesting certificate for domain: $DOMAIN"
+    if certbot certonly --standalone -d "$DOMAIN" --email "$EMAIL" --agree-tos --non-interactive >> "$LOG_FILE" 2>&1; then
         print_status "SSL certificate obtained successfully"
-        CERT_PATH="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
-        KEY_PATH="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
         
-        # Setup auto-renewal
+        # Set up auto-renewal
         (crontab -l 2>/dev/null; echo "0 12 * * * /usr/bin/certbot renew --quiet") | crontab -
         
         return 0
     else
-        print_error "Failed to obtain SSL certificate"
+        print_error "Failed to obtain SSL certificate. Check logs for details."
         return 1
     fi
+}
+
+# Function to setup bandwidth monitoring with iptables
+setup_bandwidth_monitoring() {
+    print_status "Setting up bandwidth monitoring..."
+    
+    # Install required packages
+    apt install -y iptables-persistent >> "$LOG_FILE" 2>&1
+    
+    # Create bandwidth monitoring script
+    cat > /usr/local/bin/bandwidth_monitor.sh << 'EOF'
+#!/bin/bash
+
+# Bandwidth monitoring script
+LOG_FILE="/var/log/bandwidth_daily.log"
+TIMEZONE="Africa/Nairobi"
+
+# Function to reset daily counters
+reset_daily_counters() {
+    echo "=== Daily Bandwidth Reset - $(TZ=$TIMEZONE date '+%Y-%m-%d %H:%M:%S') ===" > "$LOG_FILE"
+    echo "User bandwidth usage:" >> "$LOG_FILE"
+    
+    # Reset iptables counters
+    iptables -Z OUTPUT
+    
+    # Log current usage before reset
+    iptables -L OUTPUT -n -v | grep "bandwidth_monitor" | while read line; do
+        if [[ $line =~ ^[0-9]+ ]]; then
+            bytes=$(echo $line | awk '{print $1}')
+            user=$(echo $line | awk '{print $NF}')
+            if [[ $bytes -gt 0 ]]; then
+                echo "  $user: $(numfmt --to=iec $bytes)" >> "$LOG_FILE"
+            fi
+        fi
+    done
+    
+    echo "" >> "$LOG_FILE"
+}
+
+# Function to setup iptables rules for bandwidth monitoring
+setup_iptables_rules() {
+    # Create custom chain for bandwidth monitoring
+    iptables -N bandwidth_monitor 2>/dev/null
+    
+    # Add rules for each user (example users - modify as needed)
+    local users=("user1" "user2" "user3" "admin")
+    
+    for user in "${users[@]}"; do
+        # Add rule to track bandwidth for this user
+        iptables -A OUTPUT -m owner --uid-owner $(id -u "$user" 2>/dev/null || echo 1000) -j bandwidth_monitor
+        iptables -A bandwidth_monitor -m owner --uid-owner $(id -u "$user" 2>/dev/null || echo 1000) -j RETURN
+    done
+    
+    # Save iptables rules
+    iptables-save > /etc/iptables/rules.v4
+}
+
+# Main execution
+case "$1" in
+    "setup")
+        setup_iptables_rules
+        echo "Bandwidth monitoring rules set up"
+        ;;
+    "reset")
+        reset_daily_counters
+        echo "Daily bandwidth counters reset"
+        ;;
+    "status")
+        echo "Current bandwidth usage:"
+        iptables -L OUTPUT -n -v | grep "bandwidth_monitor"
+        ;;
+    *)
+        echo "Usage: $0 {setup|reset|status}"
+        exit 1
+        ;;
+esac
+EOF
+    
+    chmod +x /usr/local/bin/bandwidth_monitor.sh
+    
+    # Setup iptables rules
+    /usr/local/bin/bandwidth_monitor.sh setup
+    
+    # Create cron job to reset daily at midnight Africa/Nairobi timezone
+    (crontab -l 2>/dev/null; echo "0 0 * * * TZ=Africa/Nairobi /usr/local/bin/bandwidth_monitor.sh reset") | crontab -
+    
+    # Create daily reset script
+    cat > /etc/cron.daily/bandwidth-reset << 'EOF'
+#!/bin/bash
+TZ=Africa/Nairobi /usr/local/bin/bandwidth_monitor.sh reset
+EOF
+    
+    chmod +x /etc/cron.daily/bandwidth-reset
+    
+    print_status "Bandwidth monitoring set up successfully"
+    print_status "Daily reset scheduled at midnight (Africa/Nairobi timezone)"
 }
 
 # Function to install BadVPN
@@ -846,6 +881,32 @@ EOF
     fi
 }
 
+# Function to configure SSL certificates
+configure_ssl() {
+    if [[ -n "$DOMAIN" && -n "$EMAIL" ]]; then
+        print_status "Configuring SSL certificates for domain: $DOMAIN"
+        
+        # Check if certificates already exist
+        if check_ssl_certificates; then
+            print_status "Valid SSL certificates already exist"
+            return 0
+        fi
+        
+        # Request new certificate
+        if request_ssl_certificate; then
+            print_status "SSL certificates configured successfully"
+            return 0
+        else
+            print_warning "SSL certificate configuration failed"
+            return 1
+        fi
+    else
+        print_warning "Domain or email not provided. SSL certificates not configured."
+        print_warning "To configure SSL later, run: certbot --nginx -d yourdomain.com"
+        return 1
+    fi
+}
+
 # Function to create status check script
 create_status_script() {
     print_status "Creating status check script..."
@@ -856,65 +917,76 @@ create_status_script() {
 echo "=== Maxie VPS Manager - Tunneling Status ==="
 echo
 
-# Function to check service status with real verification
-check_service_status() {
-    local service_name=$1
-    local port=$2
-    local protocol=$3
-    
-    if systemctl is-active --quiet $service_name; then
-        # Check if port is actually listening
-        if netstat -tlnp | grep -q ":$port"; then
-            echo -e "✅ $service_name: \033[32mRUNNING\033[0m (Port $port/$protocol)"
-            return 0
-        else
-            echo -e "⚠️  $service_name: \033[33mSERVICE ACTIVE BUT PORT NOT LISTENING\033[0m (Port $port/$protocol)"
-            return 1
-        fi
-    else
-        echo -e "❌ $service_name: \033[31mSTOPPED\033[0m"
-        return 1
-    fi
-}
-
-# Check all services
-check_service_status "badvpn" "7300" "udp"
-check_service_status "udp-custom" "5300" "udp"
-check_service_status "stunnel4" "444" "tcp"
-check_service_status "websocket-proxy" "8080" "tcp"
-check_service_status "3proxy" "200" "tcp"
-check_service_status "dnstt" "53" "udp"
-check_service_status "sslh" "80,443" "tcp"
-check_service_status "nginx" "80" "tcp"
-
-echo
-echo "=== Port Status ==="
-netstat -tlnp | grep -E ":(7300|5300|444|8080|200|53|80|443)" | sort
-
-echo
-echo "=== Firewall Status ==="
-ufw status
-
-echo
-echo "=== Bandwidth Monitoring Status ==="
-if iptables -t mangle -L BANDWIDTH_IN >/dev/null 2>&1; then
-    echo "✅ Bandwidth monitoring: ACTIVE"
-    echo "📊 Current bandwidth usage:"
-    iptables -t mangle -L -v -x | grep -E "BANDWIDTH_.*_IN|BANDWIDTH_.*_OUT"
+# Check BadVPN
+if systemctl is-active --quiet badvpn; then
+    echo -e "✅ BadVPN: \033[32mRUNNING\033[0m (Port 7300)"
 else
-    echo "❌ Bandwidth monitoring: INACTIVE"
+    echo -e "❌ BadVPN: \033[31mSTOPPED\033[0m"
+fi
+
+# Check UDP-Custom
+if systemctl is-active --quiet udp-custom; then
+    echo -e "✅ UDP-Custom: \033[32mRUNNING\033[0m (Port 5300)"
+else
+    echo -e "❌ UDP-Custom: \033[31mSTOPPED\033[0m"
+fi
+
+# Check SSL Tunnel
+if systemctl is-active --quiet stunnel4; then
+    echo -e "✅ SSL Tunnel: \033[32mRUNNING\033[0m (Port 444)"
+else
+    echo -e "❌ SSL Tunnel: \033[31mSTOPPED\033[0m"
+fi
+
+# Check WebSocket Proxy
+if systemctl is-active --quiet websocket-proxy; then
+    echo -e "✅ WebSocket Proxy: \033[32mRUNNING\033[0m (Port 8080)"
+else
+    echo -e "❌ WebSocket Proxy: \033[31mSTOPPED\033[0m"
+fi
+
+# Check SOCKS Proxy
+if systemctl is-active --quiet 3proxy; then
+    echo -e "✅ SOCKS Proxy: \033[32mRUNNING\033[0m (Port 200)"
+else
+    echo -e "❌ SOCKS Proxy: \033[31mSTOPPED\033[0m"
+fi
+
+# Check DNSTT
+if systemctl is-active --quiet dnstt; then
+    echo -e "✅ DNSTT: \033[32mRUNNING\033[0m (Port 53)"
+else
+    echo -e "❌ DNSTT: \033[31mSTOPPED\033[0m"
+fi
+
+# Check SSLH
+if systemctl is-active --quiet sslh; then
+    echo -e "✅ SSLH: \033[32mRUNNING\033[0m (Ports 80, 443)"
+else
+    echo -e "❌ SSLH: \033[31mSTOPPED\033[0m"
+fi
+
+# Check Nginx
+if systemctl is-active --quiet nginx; then
+    echo -e "✅ Nginx: \033[32mRUNNING\033[0m"
+else
+    echo -e "❌ Nginx: \033[31mSTOPPED\033[0m"
 fi
 
 echo
-echo "=== SSL Certificate Status ==="
-if [[ -f /etc/letsencrypt/live/*/fullchain.pem ]]; then
-    echo "✅ Let's Encrypt certificate: ACTIVE"
-    find /etc/letsencrypt/live/*/fullchain.pem -exec echo "   📁 {}" \;
-elif [[ -f /etc/ssl/certs/*.crt ]]; then
-    echo "✅ SSL certificate: ACTIVE"
-    find /etc/ssl/certs/*.crt -exec echo "   📁 {}" \;
+echo "=== Port Status ==="
+netstat -tlnp 2>/dev/null | grep -E ":(7300|5300|444|8080|200|53|80|443)" | sort || echo "netstat not available"
+
+echo
+echo "=== Firewall Status ==="
+ufw status 2>/dev/null || echo "UFW not available"
+
+echo
+echo "=== Bandwidth Usage ==="
+if command -v /usr/local/bin/bandwidth_monitor.sh >/dev/null 2>&1; then
+    /usr/local/bin/bandwidth_monitor.sh status
 else
-    echo "❌ SSL certificate: NOT FOUND"
+    echo "Bandwidth monitoring not available"
 fi
 EOF
     
@@ -932,7 +1004,7 @@ create_connection_info() {
     MAXIE VPS MANAGER - CONNECTION INFO
 ==========================================
 
-Server IP: $(curl -s ifconfig.me)
+Server IP: $(curl -s ifconfig.me 2>/dev/null || echo "Unable to determine")
 Domain: ${DOMAIN:-"Not configured"}
 
 === TUNNELING PROTOCOLS ===
@@ -940,54 +1012,52 @@ Domain: ${DOMAIN:-"Not configured"}
 1. BadVPN (UDP Tunneling)
    Port: $BADVPN_PORT/udp
    Use: Gaming, multimedia streaming
-   Status: $(systemctl is-active badvpn)
+   Status: $(systemctl is-active badvpn 2>/dev/null || echo "Unknown")
 
 2. UDP-Custom (Custom UDP Proxy)
    Port: $UDP_CUSTOM_PORT/udp
    Use: Custom UDP proxy with exclusions
-   Status: $(systemctl is-active udp-custom)
+   Status: $(systemctl is-active udp-custom 2>/dev/null || echo "Unknown")
 
 3. SSL Tunnel (SSL-encrypted SSH)
    Port: $SSL_TUNNEL_PORT/tcp
    Use: SSL-encrypted SSH tunneling
-   Status: $(systemctl is-active stunnel4)
+   Status: $(systemctl is-active stunnel4 2>/dev/null || echo "Unknown")
 
 4. WebSocket Proxy (WebSocket SSH)
    Port: $WEBSOCKET_PORT/tcp
    Use: WebSocket-based SSH proxy
-   Status: $(systemctl is-active websocket-proxy)
+   Status: $(systemctl is-active websocket-proxy 2>/dev/null || echo "Unknown")
 
 5. SOCKS Proxy (SOCKS5)
    Port: $SOCKS_PORT/tcp
    Use: SOCKS5 proxy server
-   Status: $(systemctl is-active 3proxy)
+   Status: $(systemctl is-active 3proxy 2>/dev/null || echo "Unknown")
 
 6. DNSTT (DNS Tunneling)
    Port: $DNSTT_PORT/udp
    Use: DNS tunneling for bypassing restrictions
-   Status: $(systemctl is-active dnstt)
+   Status: $(systemctl is-active dnstt 2>/dev/null || echo "Unknown")
 
 7. SSLH (SSL/SSH Multiplexer)
    Ports: $SSLH_PORT_HTTP/tcp, $SSLH_PORT_HTTPS/tcp
    Use: SSL/SSH multiplexer
-   Status: $(systemctl is-active sslh)
+   Status: $(systemctl is-active sslh 2>/dev/null || echo "Unknown")
 
 8. Nginx Proxy (Reverse Proxy)
    Port: 80/tcp
    Use: Reverse proxy with WebSocket support
-   Status: $(systemctl is-active nginx)
-
-=== BANDWIDTH MONITORING ===
-
-Bandwidth monitoring is active and resets daily at midnight (Africa/Nairobi timezone)
-View current usage: iptables -t mangle -L -v -x | grep BANDWIDTH
+   Status: $(systemctl is-active nginx 2>/dev/null || echo "Unknown")
 
 === MANAGEMENT ===
 
-Check all services status:
-  check-tunneling-status
+Status Check: check-tunneling-status
+Bandwidth Monitor: /usr/local/bin/bandwidth_monitor.sh
 
 === USEFUL COMMANDS ===
+
+Check all services status:
+  check-tunneling-status
 
 Check specific service:
   systemctl status [service-name]
@@ -998,15 +1068,15 @@ View logs:
 Restart service:
   systemctl restart [service-name]
 
-View bandwidth usage:
-  iptables -t mangle -L -v -x | grep BANDWIDTH
+Check bandwidth usage:
+  /usr/local/bin/bandwidth_monitor.sh status
 
 === SECURITY NOTES ===
 
 1. Configure firewall rules as needed
 2. Monitor logs for suspicious activity
 3. Keep system updated regularly
-4. Monitor bandwidth usage
+4. Check SSL certificate validity
 
 === SUPPORT ===
 
@@ -1014,7 +1084,7 @@ For issues and support, check:
 - Service logs: journalctl -u [service-name]
 - Firewall status: ufw status
 - Port status: netstat -tlnp
-- Bandwidth usage: iptables -t mangle -L -v -x
+- Bandwidth usage: /usr/local/bin/bandwidth_monitor.sh status
 
 Generated on: $(date)
 EOF
@@ -1026,7 +1096,7 @@ EOF
 get_user_input() {
     print_header "Maxie VPS Manager - Tunneling Setup"
     echo
-    echo "This script will install and configure all tunneling protocols."
+    echo "This script will install and configure tunneling protocols."
     echo "Please provide the following information:"
     echo
     
@@ -1040,32 +1110,40 @@ get_user_input() {
     echo "Firewall: $FIREWALL_ENABLE"
     echo
     
-    read -p "Continue with installation? (y/N): " -n 1 -r
+    read -p "Continue with setup? (y/N): " -n 1 -r
     echo
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        print_status "Installation cancelled"
+        print_status "Setup cancelled"
         exit 0
     fi
 }
 
-# Function to ask for protocol installation
+# Function to ask user if they want to install a specific protocol
 ask_protocol_installation() {
-    local protocol_name=$1
-    local install_function=$2
+    local protocol_name="$1"
+    local install_function="$2"
     
     echo
     read -p "Do you want to install $protocol_name? (y/N): " -n 1 -r
     echo
+    
     if [[ $REPLY =~ ^[Yy]$ ]]; then
+        print_status "Installing $protocol_name..."
         $install_function
-        return $?
+        if [[ $? -eq 0 ]]; then
+            print_status "$protocol_name installed successfully"
+            return 0
+        else
+            print_error "$protocol_name installation failed"
+            return 1
+        fi
     else
         print_status "Skipping $protocol_name installation"
         return 0
     fi
 }
 
-# Function to install all protocols with user choice
+# Function to install all protocols with user confirmation
 install_all_protocols() {
     print_header "Installing Tunneling Protocols"
     
@@ -1170,14 +1248,271 @@ finalize_setup() {
     echo "3. Review connection info: cat /root/tunneling-connection-info.txt"
     echo "4. Monitor bandwidth usage with iptables"
     echo
-    echo "=== IMPORTANT ==="
-    echo "All services are configured to start automatically on boot"
-    echo "Firewall rules have been configured for all protocol ports"
-    echo "Bandwidth monitoring resets daily at midnight (Africa/Nairobi timezone)"
+}
+
+# Function to check service status with proper verification
+check_service_status() {
+    local service_name="$1"
+    local display_name="$2"
+    local port="$3"
+    
+    # Check if service is running
+    if ! systemctl is-active --quiet "$service_name"; then
+        return 1
+    fi
+    
+    # Check if service is listening on the expected port
+    if [[ -n "$port" ]]; then
+        local ports=(${port//,/ })
+        local port_listening=false
+        
+        for p in "${ports[@]}"; do
+            if netstat -tlnp 2>/dev/null | grep -q ":$p "; then
+                port_listening=true
+                break
+            fi
+        done
+        
+        if [[ "$port_listening" == false ]]; then
+            print_warning "$display_name service is running but not listening on expected port(s): $port"
+            return 1
+        fi
+    fi
+    
+    # Check if service process is actually running
+    if ! pgrep -f "$service_name" >/dev/null; then
+        print_warning "$display_name service shows as active but process not found"
+        return 1
+    fi
+    
+    # Additional checks for specific services
+    case "$service_name" in
+        "badvpn")
+            # Check if BadVPN is actually accepting connections
+            if ! timeout 5 bash -c "</dev/tcp/127.0.0.1/7300" 2>/dev/null; then
+                print_warning "$display_name service is running but not accepting connections"
+                return 1
+            fi
+            ;;
+        "websocket-proxy")
+            # Check if WebSocket proxy is responding
+            if ! timeout 5 bash -c "</dev/tcp/127.0.0.1/8080" 2>/dev/null; then
+                print_warning "$display_name service is running but not accepting connections"
+                return 1
+            fi
+            ;;
+        "3proxy")
+            # Check if 3proxy is responding
+            if ! timeout 5 bash -c "</dev/tcp/127.0.0.1/200" 2>/dev/null; then
+                print_warning "$display_name service is running but not accepting connections"
+                return 1
+            fi
+            ;;
+    esac
+    
+    return 0
+}
+
+# Function to show bandwidth usage display
+show_bandwidth_usage_display() {
+    echo "=== Current Bandwidth Usage ==="
+    
+    # Check if iptables rules exist
+    if ! iptables -L -n | grep -q "bandwidth_monitor"; then
+        print_warning "Bandwidth monitoring not set up. Run setup first."
+        return
+    fi
+    
+    # Show current bandwidth usage
+    echo "User Bandwidth Usage:"
+    iptables -L OUTPUT -n -v | grep "bandwidth_monitor" | while read line; do
+        if [[ $line =~ ^[0-9]+ ]]; then
+            bytes=$(echo $line | awk '{print $1}')
+            user=$(echo $line | awk '{print $NF}')
+            if [[ $bytes -gt 0 ]]; then
+                echo "  $user: $(numfmt --to=iec $bytes)"
+            fi
+        fi
+    done
+    
     echo
+    echo "Daily Bandwidth Usage (resets at midnight Africa/Nairobi):"
+    if [[ -f /var/log/bandwidth_daily.log ]]; then
+        cat /var/log/bandwidth_daily.log
+    else
+        echo "  No daily data available yet"
+    fi
+}
+
+# Function to check all services status
+check_all_services_status() {
+    echo "=== Service Status Check ==="
+    echo
+    
+    local all_running=true
+    
+    # Check BadVPN
+    if check_service_status "badvpn" "BadVPN" "7300"; then
+        echo -e "✅ BadVPN: \033[32mRUNNING\033[0m (Port 7300)"
+    else
+        echo -e "❌ BadVPN: \033[31mSTOPPED\033[0m"
+        all_running=false
+    fi
+    
+    # Check UDP-Custom
+    if check_service_status "udp-custom" "UDP-Custom" "5300"; then
+        echo -e "✅ UDP-Custom: \033[32mRUNNING\033[0m (Port 5300)"
+    else
+        echo -e "❌ UDP-Custom: \033[31mSTOPPED\033[0m"
+        all_running=false
+    fi
+    
+    # Check SSL Tunnel
+    if check_service_status "stunnel4" "SSL Tunnel" "444"; then
+        echo -e "✅ SSL Tunnel: \033[32mRUNNING\033[0m (Port 444)"
+    else
+        echo -e "❌ SSL Tunnel: \033[31mSTOPPED\033[0m"
+        all_running=false
+    fi
+    
+    # Check WebSocket Proxy
+    if check_service_status "websocket-proxy" "WebSocket Proxy" "8080"; then
+        echo -e "✅ WebSocket Proxy: \033[32mRUNNING\033[0m (Port 8080)"
+    else
+        echo -e "❌ WebSocket Proxy: \033[31mSTOPPED\033[0m"
+        all_running=false
+    fi
+    
+    # Check SOCKS Proxy
+    if check_service_status "3proxy" "SOCKS Proxy" "200"; then
+        echo -e "✅ SOCKS Proxy: \033[32mRUNNING\033[0m (Port 200)"
+    else
+        echo -e "❌ SOCKS Proxy: \033[31mSTOPPED\033[0m"
+        all_running=false
+    fi
+    
+    # Check DNSTT
+    if check_service_status "dnstt" "DNSTT" "53"; then
+        echo -e "✅ DNSTT: \033[32mRUNNING\033[0m (Port 53)"
+    else
+        echo -e "❌ DNSTT: \033[31mSTOPPED\033[0m"
+        all_running=false
+    fi
+    
+    # Check SSLH
+    if check_service_status "sslh" "SSLH" "80,443"; then
+        echo -e "✅ SSLH: \033[32mRUNNING\033[0m (Ports 80, 443)"
+    else
+        echo -e "❌ SSLH: \033[31mSTOPPED\033[0m"
+        all_running=false
+    fi
+    
+    # Check Nginx
+    if check_service_status "nginx" "Nginx" "80"; then
+        echo -e "✅ Nginx: \033[32mRUNNING\033[0m"
+    else
+        echo -e "❌ Nginx: \033[31mSTOPPED\033[0m"
+        all_running=false
+    fi
+    
+    echo
+    echo "=== Port Status ==="
+    netstat -tlnp 2>/dev/null | grep -E ":(7300|5300|444|8080|200|53|80|443)" | sort || echo "netstat not available"
+    
+    echo
+    echo "=== Firewall Status ==="
+    ufw status 2>/dev/null || echo "UFW not available"
+    
+    if [[ "$all_running" == true ]]; then
+        echo
+        print_status "All services are running properly!"
+    else
+        echo
+        print_warning "Some services are not running. Check logs for details."
+    fi
 }
 
 # Function to show main menu
 show_main_menu() {
     while true; do
+        clear
+        print_header "Maxie VPS Manager - Tunneling Setup"
+        echo
+        echo "1. Install All Protocols"
+        echo "2. Check Service Status"
+        echo "3. View Bandwidth Usage"
+        echo "4. Install Individual Protocol"
+        echo "5. View Connection Information"
+        echo "6. Exit"
+        echo
+        
+        read -p "Select option (1-6): " choice
+        
+        case $choice in
+            1) install_all_protocols ;;
+            2) check_all_services ;;
+            3) show_bandwidth_usage ;;
+            4) install_individual_protocol ;;
+            5) show_connection_info ;;
+            6) 
+                print_status "Exiting..."
+                exit 0
+                ;;
+            *) 
+                print_error "Invalid choice"
+                read -p "Press Enter to continue..."
+                ;;
+        esac
+    done
+}
+
+# Function to check all services
+check_all_services() {
+    print_header "Service Status Check"
+    echo
+    check_all_services_status
+    echo
+    read -p "Press Enter to continue..."
+}
+
+# Function to show bandwidth usage
+show_bandwidth_usage() {
+    print_header "Bandwidth Usage"
+    echo
+    show_bandwidth_usage_display
+    echo
+    read -p "Press Enter to continue..."
+}
+
+# Function to show connection info
+show_connection_info() {
+    print_header "Connection Information"
+    echo
+    if [[ -f /root/tunneling-connection-info.txt ]]; then
+        cat /root/tunneling-connection-info.txt
+    else
+        print_warning "Connection information file not found. Run setup first."
+    fi
+    echo
+    read -p "Press Enter to continue..."
+}
+
+# Main execution
+main() {
+    # Initialize log file
+    touch "$LOG_FILE"
+    echo "$(date): Starting Maxie VPS Manager tunneling setup" > "$LOG_FILE"
+    
+    check_root
+    check_system
+    get_user_input
+    update_system
+    configure_firewall
+    
+    # Show main menu instead of auto-installing
+    show_main_menu
+}
+
+# Run main function
+main "$@"
    
