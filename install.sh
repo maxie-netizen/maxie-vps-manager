@@ -94,7 +94,7 @@ declare -A DEFAULT_PORTS=(
     ["badvpn"]=7300
     ["udp-custom"]=5300
     ["ssl-tunnel"]=444
-    ["websocket"]=8080
+    ["websocket"]="multi-port"  # SSH: 80,22,8080,2222 | SSL: 443,8443 | HTTP: 8081,8082 | Proxy: 3128,8083
     ["socks"]=200
     ["dnstt"]=53
     ["sslh-http"]=80
@@ -135,22 +135,24 @@ install_protocol() {
         return 0
     fi
     
-    # Check if port is in use
-    local port_service=$(check_port_usage "$port")
-    if [[ -n "$port_service" ]]; then
-        echo -e "${YELLOW}⚠️  Port $port is being used by: $port_service${NC}"
-        read -p "Do you want to free this port automatically? (y/N): " -n 1 -r
-        echo
-        
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            echo "Stopping $port_service to free port $port..."
-            systemctl stop "$port_service" 2>/dev/null || true
-            pkill -f "$port_service" 2>/dev/null || true
-            sleep 2
-        else
-            echo -e "${RED}❌ Installation aborted. Returning to main menu.${NC}"
-            sleep 2
-            return 1
+    # Check if port is in use (skip for WebSocket as it handles multiple ports)
+    if [[ "$protocol" != "websocket" ]]; then
+        local port_service=$(check_port_usage "$port")
+        if [[ -n "$port_service" ]]; then
+            echo -e "${YELLOW}⚠️  Port $port is being used by: $port_service${NC}"
+            read -p "Do you want to free this port automatically? (y/N): " -n 1 -r
+            echo
+            
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                echo "Stopping $port_service to free port $port..."
+                systemctl stop "$port_service" 2>/dev/null || true
+                pkill -f "$port_service" 2>/dev/null || true
+                sleep 2
+            else
+                echo -e "${RED}❌ Installation aborted. Returning to main menu.${NC}"
+                sleep 2
+                return 1
+            fi
         fi
     fi
     
@@ -166,7 +168,7 @@ install_protocol() {
             install_ssl_tunnel "$port"
             ;;
         "websocket")
-            install_websocket "$port"
+            install_websocket
             ;;
         "socks")
             install_socks "$port"
@@ -190,7 +192,11 @@ install_protocol() {
     esac
     
     if [[ $? -eq 0 ]]; then
-        echo -e "${GREEN}✅ $protocol installed successfully on port $port${NC}"
+        if [[ "$protocol" == "websocket" ]]; then
+            echo -e "${GREEN}✅ $protocol installed successfully on multiple ports${NC}"
+        else
+            echo -e "${GREEN}✅ $protocol installed successfully on port $port${NC}"
+        fi
     else
         echo -e "${RED}❌ Failed to install $protocol${NC}"
     fi
@@ -402,49 +408,323 @@ OVERRIDE_EOF
 }
 
 install_websocket() {
-    local port=$1
-    apt update
-    apt install -y nodejs npm
+    echo "Installing Multi-Protocol WebSocket Proxy..."
     
-    # Install ws package for WebSocket support
-    npm install -g ws
+    apt update
+    apt install -y nodejs npm curl
     
     # Create WebSocket proxy directory
     mkdir -p /opt/websocket-proxy
     
-    # Create WebSocket proxy script
+    # Create package.json for local dependencies
+    cat > /opt/websocket-proxy/package.json << 'PACKAGE_EOF'
+{
+  "name": "websocket-proxy",
+  "version": "1.0.0",
+  "description": "Multi-Protocol WebSocket Proxy Server",
+  "main": "websocket-proxy.js",
+  "dependencies": {
+    "ws": "^8.13.0"
+  },
+  "scripts": {
+    "start": "node websocket-proxy.js"
+  }
+}
+PACKAGE_EOF
+    
+    # Create enhanced WebSocket proxy script with multiple protocols
     cat > /opt/websocket-proxy/websocket-proxy.js << 'WS_EOF'
+#!/usr/bin/env node
+
 const WebSocket = require('ws');
+const net = require('net');
 const http = require('http');
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
 
-const server = http.createServer();
-const wss = new WebSocket.Server({ server });
+// Configuration
+const PORTS = {
+    // SSH WebSocket ports
+    'ssh-ws-80': { port: 80, protocol: 'ssh', target: { host: '127.0.0.1', port: 22 } },
+    'ssh-ws-22': { port: 22, protocol: 'ssh', target: { host: '127.0.0.1', port: 22 } },
+    'ssh-ws-8080': { port: 8080, protocol: 'ssh', target: { host: '127.0.0.1', port: 22 } },
+    'ssh-ws-2222': { port: 2222, protocol: 'ssh', target: { host: '127.0.0.1', port: 22 } },
+    
+    // SSL/TLS WebSocket ports
+    'ssl-ws-443': { port: 443, protocol: 'ssl', target: { host: '127.0.0.1', port: 443 } },
+    'ssl-ws-8443': { port: 8443, protocol: 'ssl', target: { host: '127.0.0.1', port: 443 } },
+    
+    // HTTP WebSocket ports
+    'http-ws-8081': { port: 8081, protocol: 'http', target: { host: '127.0.0.1', port: 80 } },
+    'http-ws-8082': { port: 8082, protocol: 'http', target: { host: '127.0.0.1', port: 80 } },
+    
+    // Custom proxy ports
+    'proxy-3128': { port: 3128, protocol: 'proxy', target: { host: '127.0.0.1', port: 3128 } },
+    'proxy-8083': { port: 8083, protocol: 'proxy', target: { host: '127.0.0.1', port: 8083 } }
+};
 
-wss.on('connection', function connection(ws) {
-    console.log('Client connected');
-    
-    ws.on('message', function incoming(message) {
-        console.log('received: %s', message);
-        ws.send('Message received: ' + message);
-    });
-    
-    ws.on('close', function close() {
-        console.log('Client disconnected');
-    });
+// SSL certificate paths (if available)
+const SSL_CERT_PATH = '/etc/letsencrypt/live';
+const SSL_KEY_PATH = '/etc/letsencrypt/live';
+
+console.log('🚀 Starting Multi-Protocol WebSocket Proxy Server...');
+console.log('🌟 DEV MAXWELL - Advanced Tunneling Solution');
+
+// Function to check if SSL certificates exist
+function getSSLCertificates() {
+    try {
+        const certDir = fs.readdirSync(SSL_CERT_PATH);
+        const domain = certDir[0]; // Use first domain found
+        if (domain) {
+            const certFile = path.join(SSL_CERT_PATH, domain, 'fullchain.pem');
+            const keyFile = path.join(SSL_CERT_PATH, domain, 'privkey.pem');
+            
+            if (fs.existsSync(certFile) && fs.existsSync(keyFile)) {
+                console.log(`✅ SSL certificates found for domain: ${domain}`);
+                return { cert: certFile, key: keyFile, domain };
+            }
+        }
+    } catch (error) {
+        console.log('ℹ️  No SSL certificates found, using HTTP only');
+    }
+    return null;
+}
+
+// Create HTTP server for WebSocket upgrades
+const httpServer = http.createServer((req, res) => {
+    handleWebSocketUpgrade(req, res, 'http');
 });
 
-server.listen(PORT_PLACEHOLDER, '0.0.0.0', () => {
-    console.log('WebSocket proxy listening on port PORT_PLACEHOLDER');
+// Create HTTPS server if SSL certificates are available
+let httpsServer = null;
+const sslCerts = getSSLCertificates();
+if (sslCerts) {
+    try {
+        httpsServer = https.createServer({
+            cert: fs.readFileSync(sslCerts.cert),
+            key: fs.readFileSync(sslCerts.key)
+        }, (req, res) => {
+            handleWebSocketUpgrade(req, res, 'https');
+        });
+        console.log('🔐 HTTPS server created with SSL certificates');
+    } catch (error) {
+        console.log('⚠️  Failed to create HTTPS server:', error.message);
+    }
+}
+
+// Handle WebSocket upgrade requests
+function handleWebSocketUpgrade(req, res, protocol) {
+    if (req.headers.upgrade && req.headers.upgrade.toLowerCase() === 'websocket') {
+        const port = req.socket.localPort;
+        const portConfig = Object.values(PORTS).find(p => p.port === port);
+        
+        if (portConfig) {
+            const upgradeResponse = `HTTP/1.1 101 DEV MAXWELL Switching Protocols\r
+Upgrade: websocket\r
+Connection: Upgrade\r
+Sec-WebSocket-Accept: ${req.headers['sec-websocket-key']}\r
+X-Protocol: ${portConfig.protocol}\r
+X-Target: ${portConfig.target.host}:${portConfig.target.port}\r
+\r
+`;
+            
+            res.write(upgradeResponse);
+            res.end();
+            
+            console.log(`🔗 WebSocket Upgrade Request (${protocol.toUpperCase()})`);
+            console.log(`📡 Protocol: ${portConfig.protocol.toUpperCase()}`);
+            console.log(`🌐 Port: ${port} → ${portConfig.target.host}:${portConfig.target.port}`);
+            console.log(`✅ Status: 101 DEV MAXWELL Switching Protocols`);
+        } else {
+            res.writeHead(400);
+            res.end('Port not configured for WebSocket');
+        }
+    } else {
+        res.writeHead(400);
+        res.end('WebSocket upgrade required');
+    }
+}
+
+// Create WebSocket server for HTTP
+const httpWss = new WebSocket.Server({ server: httpServer });
+
+// Create WebSocket server for HTTPS
+let httpsWss = null;
+if (httpsServer) {
+    httpsWss = new WebSocket.Server({ server: httpsServer });
+}
+
+// Handle WebSocket connections
+function handleWebSocketConnection(ws, req, protocol) {
+    const port = req.socket.localPort;
+    const portConfig = Object.values(PORTS).find(p => p.port === port);
+    
+    if (!portConfig) {
+        ws.close(1000, 'Port not configured');
+        return;
+    }
+    
+    console.log(`🌟 New ${portConfig.protocol.toUpperCase()} WebSocket connection`);
+    console.log(`📍 Client IP: ${req.socket.remoteAddress}`);
+    console.log(`🌐 Port: ${port} (${portConfig.protocol})`);
+    console.log(`🎯 Target: ${portConfig.target.host}:${portConfig.target.port}`);
+    
+    // Create connection to target service
+    const tcpSocket = net.createConnection(portConfig.target.port, portConfig.target.host);
+    
+    // Handle WebSocket messages
+    ws.on('message', function message(data) {
+        try {
+            tcpSocket.write(data);
+            console.log(`📤 ${portConfig.protocol.toUpperCase()} → Target: ${data.length} bytes`);
+        } catch (error) {
+            console.error(`Error writing to ${portConfig.protocol} target:`, error);
+        }
+    });
+    
+    // Handle target responses
+    tcpSocket.on('data', function(data) {
+        try {
+            ws.send(data);
+            console.log(`📥 Target → ${portConfig.protocol.toUpperCase()}: ${data.length} bytes`);
+        } catch (error) {
+            console.error(`Error sending to WebSocket:`, error);
+        }
+    });
+    
+    // Handle connection close
+    ws.on('close', function() {
+        console.log(`🔌 ${portConfig.protocol.toUpperCase()} WebSocket connection closed`);
+        tcpSocket.destroy();
+    });
+    
+    tcpSocket.on('close', function() {
+        console.log(`🔌 ${portConfig.protocol.toUpperCase()} target connection closed`);
+        ws.close();
+    });
+    
+    // Handle errors
+    tcpSocket.on('error', function(err) {
+        console.log(`❌ ${portConfig.protocol.toUpperCase()} target error:`, err.message);
+        ws.close();
+    });
+    
+    ws.on('error', function(err) {
+        console.log(`❌ ${portConfig.protocol.toUpperCase()} WebSocket error:`, err.message);
+        tcpSocket.destroy();
+    });
+}
+
+// Set up HTTP WebSocket connections
+httpWss.on('connection', (ws, req) => handleWebSocketConnection(ws, req, 'http'));
+
+// Set up HTTPS WebSocket connections
+if (httpsWss) {
+    httpsWss.on('connection', (ws, req) => handleWebSocketConnection(ws, req, 'https'));
+}
+
+// Start HTTP server on configured ports
+Object.values(PORTS).forEach(portConfig => {
+    if (portConfig.protocol === 'http' || portConfig.protocol === 'ssh' || portConfig.protocol === 'proxy') {
+        try {
+            httpServer.listen(portConfig.port, '0.0.0.0', () => {
+                console.log(`🚀 HTTP WebSocket Server Started`);
+                console.log(`📍 Port: ${portConfig.port} (${portConfig.protocol.toUpperCase()})`);
+                console.log(`🎯 Target: ${portConfig.target.host}:${portConfig.target.port}`);
+            });
+        } catch (err) {
+            console.log(`❌ Failed to bind HTTP to port ${portConfig.port}:`, err.message);
+        }
+    }
 });
+
+// Start HTTPS server on SSL ports
+if (httpsServer) {
+    Object.values(PORTS).forEach(portConfig => {
+        if (portConfig.protocol === 'ssl') {
+            try {
+                httpsServer.listen(portConfig.port, '0.0.0.0', () => {
+                    console.log(`🔐 HTTPS WebSocket Server Started`);
+                    console.log(`📍 Port: ${portConfig.port} (${portConfig.protocol.toUpperCase()})`);
+                    console.log(`🎯 Target: ${portConfig.target.host}:${portConfig.target.port}`);
+                    console.log(`🔒 SSL: ${sslCerts.domain}`);
+                });
+            } catch (err) {
+                console.log(`❌ Failed to bind HTTPS to port ${portConfig.port}:`, err.message);
+            }
+        }
+    });
+}
+
+// Display server status
+console.log('\n🔗 WebSocket Proxy Server Configuration:');
+Object.values(PORTS).forEach(portConfig => {
+    const protocol = portConfig.protocol === 'ssl' ? 'HTTPS' : 'HTTP';
+    console.log(`  ${protocol} Port ${portConfig.port} → ${portConfig.target.host}:${portConfig.target.port} (${portConfig.protocol.toUpperCase()})`);
+});
+
+console.log('\n🌟 Ready for WebSocket connections!');
+console.log('🔐 SSL/TLS support:', sslCerts ? `Enabled (${sslCerts.domain})` : 'Disabled');
+console.log('🌐 SSH tunneling on ports: 80, 22, 8080, 2222');
+console.log('🔒 SSL/TLS on ports: 443, 8443');
+console.log('🌍 HTTP proxy on ports: 8081, 8082');
+console.log('🔄 Custom proxy on ports: 3128, 8083');
+
+// Handle server errors
+httpServer.on('error', (err) => {
+    console.log('❌ HTTP server error:', err.message);
+});
+
+if (httpsServer) {
+    httpsServer.on('error', (err) => {
+        console.log('❌ HTTPS server error:', err.message);
+    });
+}
+
+// Graceful shutdown
+function gracefulShutdown(signal) {
+    console.log(`\n📡 Received ${signal}, shutting down gracefully...`);
+    
+    if (httpServer) {
+        httpServer.close(() => {
+            console.log('🔌 HTTP server closed');
+        });
+    }
+    
+    if (httpsServer) {
+        httpsServer.close(() => {
+            console.log('🔌 HTTPS server closed');
+        });
+    }
+    
+    setTimeout(() => {
+        console.log('🚀 Server shutdown complete');
+        process.exit(0);
+    }, 1000);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 WS_EOF
     
-    # Replace port placeholder
-    sed -i "s/PORT_PLACEHOLDER/$port/g" /opt/websocket-proxy/websocket-proxy.js
+    # Install dependencies locally
+    echo "Installing WebSocket dependencies..."
+    cd /opt/websocket-proxy
+    npm install --production
+    
+    if [[ $? -ne 0 ]]; then
+        echo "❌ Failed to install npm dependencies"
+        return 1
+    fi
+    
+    # Make script executable
+    chmod +x /opt/websocket-proxy/websocket-proxy.js
     
     # Create systemd service file
     cat > /etc/systemd/system/websocket-proxy.service << 'WS_SERVICE_EOF'
 [Unit]
-Description=WebSocket Proxy
+Description=Multi-Protocol WebSocket Proxy Server
 After=network.target
 
 [Service]
@@ -452,18 +732,64 @@ Type=simple
 ExecStart=/usr/bin/node /opt/websocket-proxy/websocket-proxy.js
 WorkingDirectory=/opt/websocket-proxy
 Restart=always
+RestartSec=5
 User=root
 Group=root
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 WS_SERVICE_EOF
     
+    # Start WebSocket service
+    echo "Starting Multi-Protocol WebSocket proxy service..."
     systemctl daemon-reload
     systemctl enable websocket-proxy
-    systemctl start websocket-proxy
     
-    echo "WebSocket proxy installation completed"
+    # Try to start the service
+    if systemctl start websocket-proxy; then
+        echo "✅ Multi-Protocol WebSocket proxy started successfully"
+        
+        # Verify the service is running
+        sleep 5
+        if systemctl is-active --quiet websocket-proxy; then
+            echo "✅ WebSocket proxy is running and active"
+            
+            # Check if ports are listening
+            local listening_ports=""
+            local expected_ports="80 22 8080 2222 443 8443 8081 8082 3128 8083"
+            
+            for port in $expected_ports; do
+                if ss -tlnp | grep -q ":$port "; then
+                    listening_ports="$listening_ports $port"
+                fi
+            done
+            
+            if [[ -n "$listening_ports" ]]; then
+                echo "✅ Multi-Protocol WebSocket Proxy installed successfully!"
+                echo "🌐 Listening ports: $listening_ports"
+                echo "🔐 SSH tunneling: Ports 80, 22, 8080, 2222"
+                echo "🔒 SSL/TLS: Ports 443, 8443 (if SSL certs available)"
+                echo "🌍 HTTP proxy: Ports 8081, 8082"
+                echo "🔄 Custom proxy: Ports 3128, 8083"
+            else
+                echo "⚠️  Service is running but ports may not be listening yet"
+            fi
+        else
+            echo "❌ WebSocket service may not be fully started"
+            systemctl status websocket-proxy --no-pager -l
+            return 1
+        fi
+    else
+        echo "❌ Failed to start WebSocket proxy service"
+        echo "Checking service status..."
+        systemctl status websocket-proxy --no-pager -l
+        return 1
+        return 1
+    fi
+    
+    echo "Multi-Protocol WebSocket proxy installation completed"
 }
 
 install_socks() {
@@ -684,21 +1010,19 @@ install_dropbear() {
     # Wait a moment for dropbearkey to be available
     sleep 2
     
-    # Configure Dropbear
-    cat > /etc/default/dropbear << EOF
-# Dropbear SSH Server Configuration
-DROPBEAR_PORT=$port
-DROPBEAR_EXTRA_ARGS="-p 2222"
-DROPBEAR_BANNER="/etc/dropbear/banner"
-DROPBEAR_RSAKEY="/etc/dropbear/dropbear_rsa_host_key"
-DROPBEAR_ECDSAKEY="/etc/dropbear/dropbear_ecdsa_host_key"
-DROPBEAR_ED25519KEY="/etc/dropbear/dropbear_ed25519_host_key"
-DROPBEAR_WINDOW_SIZE=65536
-DROPBEAR_KEEPALIVE=0
-DROPBEAR_PIDFILE="/var/run/dropbear.pid"
-DROPBEAR_LOG_LEVEL=1
-DROPBEAR_EXTRA_ARGS="-s -g -j -k"
-EOF
+    # Check if dropbearkey is available
+    if ! command -v dropbearkey &> /dev/null; then
+        echo "❌ dropbearkey command not found. Trying to reinstall dropbear..."
+        apt install --reinstall -y dropbear
+        sleep 2
+        
+        if ! command -v dropbearkey &> /dev/null; then
+            echo "❌ dropbearkey still not available. Installation failed."
+            return 1
+        fi
+    fi
+    
+    echo "✅ dropbearkey command found"
     
     # Create banner
     mkdir -p /etc/dropbear
@@ -710,17 +1034,66 @@ Welcome to the server!
 BANNER_EOF
     
     # Generate host keys if they don't exist
+    echo "Generating Dropbear host keys..."
+    
+    # Force generate RSA key
     if [[ ! -f /etc/dropbear/dropbear_rsa_host_key ]]; then
-        dropbearkey -t rsa -f /etc/dropbear/dropbear_rsa_host_key -s 2048 2>/dev/null || echo "Warning: Could not generate RSA key"
+        dropbearkey -t rsa -f /etc/dropbear/dropbear_rsa_host_key -s 2048
+        if [[ $? -eq 0 ]]; then
+            echo "✅ RSA key generated successfully"
+        else
+            echo "❌ Failed to generate RSA key"
+            return 1
+        fi
     fi
     
+    # Force generate ECDSA key
     if [[ ! -f /etc/dropbear/dropbear_ecdsa_host_key ]]; then
-        dropbearkey -t ecdsa -f /etc/dropbear/dropbear_ecdsa_host_key -s 256 2>/dev/null || echo "Warning: Could not generate ECDSA key"
+        dropbearkey -t ecdsa -f /etc/dropbear/dropbear_ecdsa_host_key -s 256
+        if [[ $? -eq 0 ]]; then
+            echo "✅ ECDSA key generated successfully"
+        else
+            echo "❌ Failed to generate ECDSA key"
+            return 1
+        fi
     fi
     
+    # Force generate ED25519 key
     if [[ ! -f /etc/dropbear/dropbear_ed25519_host_key ]]; then
-        dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null || echo "Warning: Could not generate ED25519 key"
+        dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key
+        if [[ $? -eq 0 ]]; then
+            echo "✅ ED25519 key generated successfully"
+        else
+            echo "❌ Failed to generate ED25519 key"
+            return 1
+        fi
     fi
+    
+    # Verify all keys exist before proceeding
+    if [[ ! -f /etc/dropbear/dropbear_rsa_host_key ]] || \
+       [[ ! -f /etc/dropbear/dropbear_ecdsa_host_key ]] || \
+       [[ ! -f /etc/dropbear/dropbear_ed25519_host_key ]]; then
+        echo "❌ Not all host keys were generated. Installation failed."
+        return 1
+    fi
+    
+    # Configure Dropbear
+    cat > /etc/default/dropbear << 'DROPBEAR_CONFIG_EOF'
+# Dropbear SSH Server Configuration
+DROPBEAR_PORT=PORT_PLACEHOLDER
+DROPBEAR_EXTRA_ARGS="-p 2222"
+DROPBEAR_BANNER="/etc/dropbear/banner"
+DROPBEAR_RSAKEY="/etc/dropbear/dropbear_rsa_host_key"
+DROPBEAR_ECDSAKEY="/etc/dropbear/dropbear_ecdsa_host_key"
+DROPBEAR_ED25519KEY="/etc/dropbear/dropbear_ed25519_host_key"
+DROPBEAR_WINDOW_SIZE=65536
+DROPBEAR_KEEPALIVE=0
+DROPBEAR_PIDFILE="/var/run/dropbear.pid"
+DROPBEAR_LOG_LEVEL=1
+DROPBEAR_CONFIG_EOF
+    
+    # Replace port placeholder in config
+    sed -i "s/PORT_PLACEHOLDER/$port/g" /etc/default/dropbear
     
     # Create systemd service file for Dropbear
     cat > /etc/systemd/system/dropbear.service << 'DROPBEAR_SERVICE_EOF'
@@ -729,11 +1102,14 @@ Description=Dropbear SSH Server
 After=network.target
 
 [Service]
-Type=notify
+Type=simple
 ExecStart=/usr/sbin/dropbear -F -R -p 0.0.0.0:PORT_PLACEHOLDER -p 0.0.0.0:2222
 Restart=always
+RestartSec=5
 User=root
 Group=root
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -742,10 +1118,48 @@ DROPBEAR_SERVICE_EOF
     # Replace port placeholder
     sed -i "s/PORT_PLACEHOLDER/$port/g" /etc/systemd/system/dropbear.service
     
+    # Set proper permissions only if files exist
+    echo "Setting permissions on host keys..."
+    if [[ -f /etc/dropbear/dropbear_rsa_host_key ]]; then
+        chmod 600 /etc/dropbear/dropbear_rsa_host_key
+        chown root:root /etc/dropbear/dropbear_rsa_host_key
+        echo "✅ RSA key permissions set"
+    fi
+    
+    if [[ -f /etc/dropbear/dropbear_ecdsa_host_key ]]; then
+        chmod 600 /etc/dropbear/dropbear_ecdsa_host_key
+        chown root:root /etc/dropbear/dropbear_ecdsa_host_key
+        echo "✅ ECDSA key permissions set"
+    fi
+    
+    if [[ -f /etc/dropbear/dropbear_ed25519_host_key ]]; then
+        chmod 600 /etc/dropbear/dropbear_ed25519_host_key
+        chown root:root /etc/dropbear/dropbear_ed25519_host_key
+        echo "✅ ED25519 key permissions set"
+    fi
+    
     # Start Dropbear
+    echo "Starting Dropbear service..."
     systemctl daemon-reload
     systemctl enable dropbear
-    systemctl start dropbear
+    
+    # Try to start the service
+    if systemctl start dropbear; then
+        echo "✅ Dropbear SSH started successfully"
+        
+        # Verify the service is running
+        sleep 2
+        if systemctl is-active --quiet dropbear; then
+            echo "✅ Dropbear SSH is running and active"
+        else
+            echo "⚠️  Dropbear service may not be fully started"
+        fi
+    else
+        echo "❌ Failed to start Dropbear service"
+        echo "Checking service status..."
+        systemctl status dropbear --no-pager -l
+        return 1
+    fi
     
     echo "Dropbear SSH installation completed"
 }
@@ -843,9 +1257,15 @@ manage_individual_protocols() {
                 install_protocol "ssl-tunnel" "$port"
                 ;;
             4)
-                read -p "Enter port for WebSocket (default: 8080): " port
-                port=${port:-8080}
-                install_protocol "websocket" "$port"
+                echo -e "${BLUE}🌐 WebSocket Proxy - Multi-Protocol Service${NC}"
+                echo -e "${YELLOW}This service will be installed on multiple ports:${NC}"
+                echo -e "  🔐 SSH tunneling: Ports 80, 22, 8080, 2222"
+                echo -e "  🔒 SSL/TLS: Ports 443, 8443 (if SSL certs available)"
+                echo -e "  🌍 HTTP proxy: Ports 8081, 8082"
+                echo -e "  🔄 Custom proxy: Ports 3128, 8083"
+                echo
+                read -p "Press Enter to continue with installation..."
+                install_protocol "websocket"
                 ;;
             5)
                 read -p "Enter port for SOCKS (default: 200): " port
@@ -951,11 +1371,21 @@ check_services() {
     
     echo
     echo "=== Port Status ==="
-    ss -tlnp 2>/dev/null | grep -E ":(7300|5300|444|8080|200|53|80|443|8443|8081|22)" | sort | while read line; do
+    ss -tlnp 2>/dev/null | grep -E ":(7300|5300|444|8080|200|53|80|443|8443|8081|22|2222|8082|3128|8083)" | sort | while read line; do
         local port=$(echo "$line" | grep -o ":[0-9]*" | head -1 | cut -d: -f2)
         local service=$(echo "$line" | awk '{print $NF}' | cut -d'/' -f2)
         local pid=$(echo "$line" | awk '{print $NF}' | cut -d'/' -f1)
-        echo "  Port $port: $service (PID: $pid)"
+        
+        # Special handling for WebSocket ports
+        if [[ "$port" =~ ^(80|22|8080|2222|443|8443|8081|8082|3128|8083)$ ]]; then
+            if [[ "$service" == "node" ]]; then
+                echo "  Port $port: WebSocket Proxy (PID: $pid) - Multi-Protocol"
+            else
+                echo "  Port $port: $service (PID: $pid)"
+            fi
+        else
+            echo "  Port $port: $service (PID: $pid)"
+        fi
     done || echo "ss command not available"
     
     echo
@@ -1225,5 +1655,7 @@ echo "- SSL certificates will auto-renew every 90 days"
 echo "- All tunneling protocols run as systemd services for automatic startup"
 echo "- Bandwidth monitoring resets daily at midnight (Africa/Nairobi timezone)"
 echo "- Dropbear SSH provides lightweight SSH server functionality"
+echo "- WebSocket Proxy supports multiple protocols: SSH, SSL/TLS, HTTP, and custom proxy"
+echo "- WebSocket automatically detects and uses SSL certificates when available"
 echo
 echo "Installation completed at: $(date)"
