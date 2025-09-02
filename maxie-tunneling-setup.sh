@@ -1099,6 +1099,68 @@ EOF
     fi
 }
 
+# Function to install Dropbear SSH Server
+install_dropbear_ssh() {
+    print_status "Installing Dropbear SSH Server..."
+    
+    # Install Dropbear
+    apt install -y dropbear >> "$LOG_FILE" 2>&1
+    
+    # Configure Dropbear
+    cat > /etc/default/dropbear << EOF
+# Dropbear SSH Server Configuration
+DROPBEAR_PORT=22
+DROPBEAR_EXTRA_ARGS="-p 2222"
+DROPBEAR_BANNER="/etc/dropbear/banner"
+DROPBEAR_RSAKEY="/etc/dropbear/dropbear_rsa_host_key"
+DROPBEAR_DSSKEY="/etc/dropbear/dropbear_dss_host_key"
+DROPBEAR_ECDSAKEY="/etc/dropbear/dropbear_ecdsa_host_key"
+DROPBEAR_ED25519KEY="/etc/dropbear/dropbear_ed25519_host_key"
+DROPBEAR_WINDOW_SIZE=65536
+DROPBEAR_KEEPALIVE=0
+DROPBEAR_PIDFILE="/var/run/dropbear.pid"
+DROPBEAR_LOG_LEVEL=1
+DROPBEAR_EXTRA_ARGS="-s -g -j -k"
+EOF
+    
+    # Create banner
+    mkdir -p /etc/dropbear
+    cat > /etc/dropbear/banner << EOF
+==========================================
+    MAXIE VPS MANAGER - DROPBEAR SSH
+==========================================
+Welcome to the server!
+EOF
+    
+    # Generate host keys if they don't exist
+    if [[ ! -f /etc/dropbear/dropbear_rsa_host_key ]]; then
+        dropbearkey -t rsa -f /etc/dropbear/dropbear_rsa_host_key -s 2048 >> "$LOG_FILE" 2>&1
+    fi
+    
+    if [[ ! -f /etc/dropbear/dropbear_ecdsa_host_key ]]; then
+        dropbearkey -t ecdsa -f /etc/dropbear/dropbear_ecdsa_host_key -s 256 >> "$LOG_FILE" 2>&1
+    fi
+    
+    if [[ ! -f /etc/dropbear/dropbear_ed25519_host_key ]]; then
+        dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key >> "$LOG_FILE" 2>&1
+    fi
+    
+    # Start Dropbear
+    systemctl enable dropbear
+    systemctl start dropbear
+    
+    # Verify service is actually running
+    sleep 3
+    if systemctl is-active --quiet dropbear && netstat -tlnp | grep -q ":22 "; then
+        print_status "Dropbear SSH installed and started on port 22"
+        print_status "Additional port 2222 also available"
+        return 0
+    else
+        print_error "Dropbear SSH failed to start properly"
+        return 1
+    fi
+}
+
 # Function to configure SSL certificates
 configure_ssl() {
     if [[ -n "$DOMAIN" && -n "$EMAIL" ]]; then
@@ -1393,6 +1455,11 @@ Domain: ${DOMAIN:-"Not configured"}
    Use: Reverse proxy with WebSocket support
    Status: $(systemctl is-active nginx 2>/dev/null || echo "Unknown")
 
+9. Dropbear SSH (Lightweight SSH Server)
+   Port: 22/tcp
+   Use: Lightweight SSH server (more efficient than OpenSSH)
+   Status: $(systemctl is-active dropbear 2>/dev/null || echo "Unknown")
+
 === MANAGEMENT ===
 
 Status Check: check-tunneling-status
@@ -1544,6 +1611,9 @@ install_all_protocols() {
     ask_protocol_installation "Nginx Proxy" install_nginx_proxy
     if [[ $? -ne 0 ]]; then all_installed=false; fi
     
+    ask_protocol_installation "Dropbear SSH" install_dropbear_ssh
+    if [[ $? -ne 0 ]]; then all_installed=false; fi
+    
     if [[ "$all_installed" == true ]]; then
         print_status "All selected protocols installed successfully"
     else
@@ -1564,10 +1634,11 @@ install_individual_protocol() {
     echo "6. DNSTT (DNS Tunneling)"
     echo "7. SSLH (SSL/SSH Multiplexer)"
     echo "8. Nginx Proxy (Reverse Proxy)"
-    echo "9. Back to main menu"
+    echo "9. Dropbear SSH (Lightweight SSH Server)"
+    echo "10. Back to main menu"
     echo
     
-    read -p "Select protocol to install (1-9): " choice
+    read -p "Select protocol to install (1-10): " choice
     
     case $choice in
         1) install_badvpn ;;
@@ -1578,7 +1649,8 @@ install_individual_protocol() {
         6) install_dnstt ;;
         7) install_sslh ;;
         8) install_nginx_proxy ;;
-        9) return ;;
+        9) install_dropbear_ssh ;;
+        10) return ;;
         *) print_error "Invalid choice"; return ;;
     esac
     
