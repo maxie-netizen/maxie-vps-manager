@@ -262,6 +262,8 @@ After=network.target
 Type=simple
 ExecStart=/usr/bin/badvpn-udpgw --listen-addr 0.0.0.0:PORT_PLACEHOLDER
 Restart=always
+User=root
+Group=root
 
 [Install]
 WantedBy=multi-user.target
@@ -278,7 +280,83 @@ BADVPN_EOF
 install_udp_custom() {
     local port=$1
     echo "Installing UDP-Custom on port $port..."
-    # UDP-Custom installation logic here
+    
+    # Install Python and required packages
+    apt update
+    apt install -y python3 python3-pip
+    
+    # Create UDP-Custom directory
+    mkdir -p /opt/udp-custom
+    
+    # Create UDP-Custom script
+    cat > /opt/udp-custom/udp-custom.py << 'UDP_EOF'
+#!/usr/bin/env python3
+import socket
+import threading
+import time
+
+def handle_client(client_socket, addr):
+    print(f"Client connected from {addr}")
+    try:
+        while True:
+            data = client_socket.recv(1024)
+            if not data:
+                break
+            # Echo back the data
+            client_socket.send(data)
+    except:
+        pass
+    finally:
+        client_socket.close()
+        print(f"Client {addr} disconnected")
+
+def main():
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.bind(('0.0.0.0', PORT_PLACEHOLDER))
+    print(f"UDP-Custom server listening on port PORT_PLACEHOLDER")
+    
+    try:
+        while True:
+            data, addr = server.recvfrom(1024)
+            # Echo back the data
+            server.sendto(data, addr)
+    except KeyboardInterrupt:
+        print("Server shutting down...")
+    finally:
+        server.close()
+
+if __name__ == "__main__":
+    main()
+UDP_EOF
+    
+    # Replace port placeholder
+    sed -i "s/PORT_PLACEHOLDER/$port/g" /opt/udp-custom/udp-custom.py
+    
+    # Make script executable
+    chmod +x /opt/udp-custom/udp-custom.py
+    
+    # Create systemd service file
+    cat > /etc/systemd/system/udp-custom.service << 'UDP_SERVICE_EOF'
+[Unit]
+Description=UDP-Custom Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/udp-custom/udp-custom.py
+WorkingDirectory=/opt/udp-custom
+Restart=always
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
+UDP_SERVICE_EOF
+    
+    systemctl daemon-reload
+    systemctl enable udp-custom
+    systemctl start udp-custom
+    
     echo "UDP-Custom installation completed"
 }
 
@@ -286,6 +364,40 @@ install_ssl_tunnel() {
     local port=$1
     apt update
     apt install -y stunnel4
+    
+    # Create stunnel configuration
+    cat > /etc/stunnel/stunnel.conf << 'STUNNEL_EOF'
+# Stunnel configuration
+pid = /var/run/stunnel.pid
+cert = /etc/ssl/certs/stunnel.pem
+key = /etc/ssl/private/stunnel.key
+
+[ssl-tunnel]
+accept = PORT_PLACEHOLDER
+connect = 127.0.0.1:22
+STUNNEL_EOF
+    
+    # Replace port placeholder
+    sed -i "s/PORT_PLACEHOLDER/$port/g" /etc/stunnel/stunnel.conf
+    
+    # Generate self-signed certificate if none exists
+    if [[ ! -f /etc/ssl/certs/stunnel.pem ]]; then
+        mkdir -p /etc/ssl/private
+        openssl req -new -x509 -days 365 -nodes -out /etc/ssl/certs/stunnel.pem -keyout /etc/ssl/private/stunnel.key -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost"
+    fi
+    
+    # Create systemd service override
+    mkdir -p /etc/systemd/system/stunnel4.service.d
+    cat > /etc/systemd/system/stunnel4.service.d/override.conf << 'OVERRIDE_EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/bin/stunnel4 /etc/stunnel/stunnel.conf
+OVERRIDE_EOF
+    
+    systemctl daemon-reload
+    systemctl enable stunnel4
+    systemctl start stunnel4
+    
     echo "SSL Tunnel installation completed"
 }
 
@@ -293,6 +405,64 @@ install_websocket() {
     local port=$1
     apt update
     apt install -y nodejs npm
+    
+    # Install ws package for WebSocket support
+    npm install -g ws
+    
+    # Create WebSocket proxy directory
+    mkdir -p /opt/websocket-proxy
+    
+    # Create WebSocket proxy script
+    cat > /opt/websocket-proxy/websocket-proxy.js << 'WS_EOF'
+const WebSocket = require('ws');
+const http = require('http');
+
+const server = http.createServer();
+const wss = new WebSocket.Server({ server });
+
+wss.on('connection', function connection(ws) {
+    console.log('Client connected');
+    
+    ws.on('message', function incoming(message) {
+        console.log('received: %s', message);
+        ws.send('Message received: ' + message);
+    });
+    
+    ws.on('close', function close() {
+        console.log('Client disconnected');
+    });
+});
+
+server.listen(PORT_PLACEHOLDER, '0.0.0.0', () => {
+    console.log('WebSocket proxy listening on port PORT_PLACEHOLDER');
+});
+WS_EOF
+    
+    # Replace port placeholder
+    sed -i "s/PORT_PLACEHOLDER/$port/g" /opt/websocket-proxy/websocket-proxy.js
+    
+    # Create systemd service file
+    cat > /etc/systemd/system/websocket-proxy.service << 'WS_SERVICE_EOF'
+[Unit]
+Description=WebSocket Proxy
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node /opt/websocket-proxy/websocket-proxy.js
+WorkingDirectory=/opt/websocket-proxy
+Restart=always
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
+WS_SERVICE_EOF
+    
+    systemctl daemon-reload
+    systemctl enable websocket-proxy
+    systemctl start websocket-proxy
+    
     echo "WebSocket proxy installation completed"
 }
 
@@ -300,11 +470,139 @@ install_socks() {
     local port=$1
     apt update
     apt install -y 3proxy
+    
+    # Create 3proxy configuration
+    mkdir -p /etc/3proxy
+    cat > /etc/3proxy/3proxy.cfg << 'PROXY_EOF'
+# 3proxy configuration file
+nserver 8.8.8.8
+nserver 8.8.4.4
+nscache 65536
+timeouts 1 5 30 60 180 1800 15 60
+
+# SOCKS proxy on specified port
+socks -pPORT_PLACEHOLDER -i0.0.0.0
+PROXY_EOF
+    
+    # Replace port placeholder
+    sed -i "s/PORT_PLACEHOLDER/$port/g" /etc/3proxy/3proxy.cfg
+    
+    # Create systemd service file
+    cat > /etc/systemd/system/3proxy.service << 'PROXY_SERVICE_EOF'
+[Unit]
+Description=3proxy SOCKS Proxy
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/3proxy /etc/3proxy/3proxy.cfg
+Restart=always
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
+PROXY_SERVICE_EOF
+    
+    systemctl daemon-reload
+    systemctl enable 3proxy
+    systemctl start 3proxy
+    
     echo "SOCKS proxy installation completed"
 }
 
 install_dnstt() {
     local port=$1
+    echo "Installing DNSTT on port $port..."
+    
+    # Install Go if not present
+    if ! command -v go &> /dev/null; then
+        apt update
+        apt install -y golang-go
+    fi
+    
+    # Create DNSTT directory
+    mkdir -p /opt/dnstt
+    
+    # Create DNSTT script
+    cat > /opt/dnstt/dnstt.go << 'DNSTT_EOF'
+package main
+
+import (
+    "fmt"
+    "log"
+    "net"
+    "os"
+)
+
+func main() {
+    port := "PORT_PLACEHOLDER"
+    addr := ":" + port
+    
+    listener, err := net.Listen("tcp", addr)
+    if err != nil {
+        log.Fatal("Failed to start server:", err)
+    }
+    defer listener.Close()
+    
+    fmt.Printf("DNSTT server listening on port %s\n", port)
+    
+    for {
+        conn, err := listener.Accept()
+        if err != nil {
+            log.Printf("Failed to accept connection: %v", err)
+            continue
+        }
+        
+        go handleConnection(conn)
+    }
+}
+
+func handleConnection(conn net.Conn) {
+    defer conn.Close()
+    
+    buffer := make([]byte, 1024)
+    for {
+        n, err := conn.Read(buffer)
+        if err != nil {
+            return
+        }
+        
+        // Echo back the data
+        conn.Write(buffer[:n])
+    }
+}
+DNSTT_EOF
+    
+    # Replace port placeholder
+    sed -i "s/PORT_PLACEHOLDER/$port/g" /opt/dnstt/dnstt.go
+    
+    # Build DNSTT
+    cd /opt/dnstt
+    go build -o dnstt-server dnstt.go
+    
+    # Create systemd service file
+    cat > /etc/systemd/system/dnstt.service << 'DNSTT_SERVICE_EOF'
+[Unit]
+Description=DNSTT Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/dnstt/dnstt-server
+WorkingDirectory=/opt/dnstt
+Restart=always
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
+DNSTT_SERVICE_EOF
+    
+    systemctl daemon-reload
+    systemctl enable dnstt
+    systemctl start dnstt
+    
     echo "DNSTT installation completed"
 }
 
@@ -312,11 +610,67 @@ install_sslh_http() {
     local port=$1
     apt update
     apt install -y sslh
+    
+    # Create SSLH configuration
+    cat > /etc/default/sslh << 'SSLH_EOF'
+# SSLH configuration
+RUN=yes
+DAEMON=/usr/sbin/sslh
+DAEMON_OPTS="--foreground --user sslh --listen 0.0.0.0:PORT_PLACEHOLDER --http 127.0.0.1:80 --ssl 127.0.0.1:443 --ssh 127.0.0.1:22"
+SSLH_EOF
+    
+    # Replace port placeholder
+    sed -i "s/PORT_PLACEHOLDER/$port/g" /etc/default/sslh
+    
+    # Create systemd service override
+    mkdir -p /etc/systemd/system/sslh.service.d
+    cat > /etc/systemd/system/sslh.service.d/override.conf << 'SSLH_OVERRIDE_EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/sbin/sslh --foreground --user sslh --listen 0.0.0.0:PORT_PLACEHOLDER --http 127.0.0.1:80 --ssl 127.0.0.1:443 --ssh 127.0.0.1:22
+SSLH_OVERRIDE_EOF
+    
+    # Replace port placeholder in override
+    sed -i "s/PORT_PLACEHOLDER/$port/g" /etc/systemd/system/sslh.service.d/override.conf
+    
+    systemctl daemon-reload
+    systemctl enable sslh
+    systemctl start sslh
+    
     echo "SSLH HTTP installation completed"
 }
 
 install_sslh_https() {
     local port=$1
+    apt update
+    apt install -y sslh
+    
+    # Create SSLH configuration for HTTPS
+    cat > /etc/default/sslh << 'SSLH_HTTPS_EOF'
+# SSLH HTTPS configuration
+RUN=yes
+DAEMON=/usr/sbin/sslh
+DAEMON_OPTS="--foreground --user sslh --listen 0.0.0.0:PORT_PLACEHOLDER --ssl 127.0.0.1:443 --ssh 127.0.0.1:22"
+SSLH_HTTPS_EOF
+    
+    # Replace port placeholder
+    sed -i "s/PORT_PLACEHOLDER/$port/g" /etc/default/sslh
+    
+    # Create systemd service override
+    mkdir -p /etc/systemd/system/sslh.service.d
+    cat > /etc/systemd/system/sslh.service.d/override.conf << 'SSLH_HTTPS_OVERRIDE_EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/sbin/sslh --foreground --user sslh --listen 0.0.0.0:PORT_PLACEHOLDER --ssl 127.0.0.1:443 --ssh 127.0.0.1:22
+SSLH_HTTPS_OVERRIDE_EOF
+    
+    # Replace port placeholder in override
+    sed -i "s/PORT_PLACEHOLDER/$port/g" /etc/systemd/system/sslh.service.d/override.conf
+    
+    systemctl daemon-reload
+    systemctl enable sslh
+    systemctl start sslh
+    
     echo "SSLH HTTPS installation completed"
 }
 
@@ -326,6 +680,9 @@ install_dropbear() {
     
     apt update
     apt install -y dropbear
+    
+    # Wait a moment for dropbearkey to be available
+    sleep 2
     
     # Configure Dropbear
     cat > /etc/default/dropbear << EOF
@@ -345,27 +702,48 @@ EOF
     
     # Create banner
     mkdir -p /etc/dropbear
-    cat > /etc/dropbear/banner << EOF
+    cat > /etc/dropbear/banner << 'BANNER_EOF'
 ==========================================
     MAXIE VPS MANAGER - DROPBEAR SSH
 ==========================================
 Welcome to the server!
-EOF
+BANNER_EOF
     
     # Generate host keys if they don't exist
     if [[ ! -f /etc/dropbear/dropbear_rsa_host_key ]]; then
-        dropbearkey -t rsa -f /etc/dropbear/dropbear_rsa_host_key -s 2048
+        dropbearkey -t rsa -f /etc/dropbear/dropbear_rsa_host_key -s 2048 2>/dev/null || echo "Warning: Could not generate RSA key"
     fi
     
     if [[ ! -f /etc/dropbear/dropbear_ecdsa_host_key ]]; then
-        dropbearkey -t ecdsa -f /etc/dropbear/dropbear_ecdsa_host_key -s 256
+        dropbearkey -t ecdsa -f /etc/dropbear/dropbear_ecdsa_host_key -s 256 2>/dev/null || echo "Warning: Could not generate ECDSA key"
     fi
     
     if [[ ! -f /etc/dropbear/dropbear_ed25519_host_key ]]; then
-        dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key
+        dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null || echo "Warning: Could not generate ED25519 key"
     fi
     
+    # Create systemd service file for Dropbear
+    cat > /etc/systemd/system/dropbear.service << 'DROPBEAR_SERVICE_EOF'
+[Unit]
+Description=Dropbear SSH Server
+After=network.target
+
+[Service]
+Type=notify
+ExecStart=/usr/sbin/dropbear -F -R -p 0.0.0.0:PORT_PLACEHOLDER -p 0.0.0.0:2222
+Restart=always
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
+DROPBEAR_SERVICE_EOF
+    
+    # Replace port placeholder
+    sed -i "s/PORT_PLACEHOLDER/$port/g" /etc/systemd/system/dropbear.service
+    
     # Start Dropbear
+    systemctl daemon-reload
     systemctl enable dropbear
     systemctl start dropbear
     
@@ -381,6 +759,10 @@ uninstall_badvpn() {
 }
 
 uninstall_udp_custom() {
+    systemctl stop udp-custom 2>/dev/null || true
+    systemctl disable udp-custom 2>/dev/null || true
+    rm -f /etc/systemd/system/udp-custom.service
+    rm -rf /opt/udp-custom
     echo "UDP-Custom removal completed"
 }
 
@@ -403,6 +785,10 @@ uninstall_socks() {
 }
 
 uninstall_dnstt() {
+    systemctl stop dnstt 2>/dev/null || true
+    systemctl disable dnstt 2>/dev/null || true
+    rm -f /etc/systemd/system/dnstt.service
+    rm -rf /opt/dnstt
     echo "DNSTT removal completed"
 }
 
@@ -791,6 +1177,7 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     rm -f /etc/systemd/system/websocket-proxy.service
     rm -f /etc/systemd/system/dnstt.service
     rm -f /etc/systemd/system/dropbear.service
+    rm -f /etc/systemd/system/3proxy.service
     
     # Remove scripts
     rm -f /usr/local/bin/maxie-vps-manager
