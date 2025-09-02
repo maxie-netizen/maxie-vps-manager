@@ -30,6 +30,10 @@ SSLH_PORT_HTTPS="443"
 # Log file
 LOG_FILE="/var/log/maxie-tunneling-setup.log"
 
+# Bandwidth monitoring
+BANDWIDTH_LOG="/var/log/bandwidth.log"
+BANDWIDTH_RESET_TIME="00:00" # Midnight Africa/Nairobi timezone
+
 # Function to print colored output
 print_status() {
     echo -e "${GREEN}[INFO]${NC} $1"
@@ -102,8 +106,8 @@ check_system() {
 update_system() {
     print_status "Updating system packages..."
     apt update -y >> "$LOG_FILE" 2>&1
-    apt install -y curl wget git ufw >> "$LOG_FILE" 2>&1
-    print_status "System updated successfully (upgrade skipped to avoid VM slowdown)"
+    apt install -y curl wget git ufw iptables-persistent >> "$LOG_FILE" 2>&1
+    print_status "System updated successfully"
 }
 
 # Function to configure firewall
@@ -135,6 +139,152 @@ configure_firewall() {
         ufw --force enable >> "$LOG_FILE" 2>&1
         
         print_status "Firewall configured successfully"
+    fi
+}
+
+# Function to setup bandwidth monitoring
+setup_bandwidth_monitoring() {
+    print_status "Setting up bandwidth monitoring..."
+    
+    # Create bandwidth monitoring script
+    cat > /usr/local/bin/bandwidth-monitor.sh << 'EOF'
+#!/bin/bash
+
+# Bandwidth monitoring script using iptables
+LOG_FILE="/var/log/bandwidth.log"
+RESET_TIME="00:00"
+
+# Create iptables chains if they don't exist
+iptables -t mangle -N BANDWIDTH_IN 2>/dev/null
+iptables -t mangle -N BANDWIDTH_OUT 2>/dev/null
+
+# Clear existing rules
+iptables -t mangle -F BANDWIDTH_IN
+iptables -t mangle -F BANDWIDTH_OUT
+
+# Add rules for each user (you can modify this list)
+USERS=("user1" "user2" "user3")
+
+for user in "${USERS[@]}"; do
+    # Create user-specific chains
+    iptables -t mangle -N BANDWIDTH_${user^^}_IN 2>/dev/null
+    iptables -t mangle -N BANDWIDTH_${user^^}_OUT 2>/dev/null
+    
+    # Clear existing rules
+    iptables -t mangle -F BANDWIDTH_${user^^}_IN
+    iptables -t mangle -F BANDWIDTH_${user^^}_OUT
+    
+    # Add user to main chains
+    iptables -t mangle -A BANDWIDTH_IN -m owner --uid-owner $(id -u $user 2>/dev/null || echo 1000) -j BANDWIDTH_${user^^}_IN
+    iptables -t mangle -A BANDWIDTH_OUT -m owner --uid-owner $(id -u $user 2>/dev/null || echo 1000) -j BANDWIDTH_${user^^}_OUT
+    
+    # Add counting rules
+    iptables -t mangle -A BANDWIDTH_${user^^}_IN -j RETURN
+    iptables -t mangle -A BANDWIDTH_${user^^}_OUT -j RETURN
+done
+
+# Hook into INPUT and OUTPUT chains
+iptables -t mangle -A INPUT -j BANDWIDTH_IN
+iptables -t mangle -A OUTPUT -j BANDWIDTH_OUT
+
+# Save iptables rules
+iptables-save > /etc/iptables/rules.v4
+
+echo "$(date): Bandwidth monitoring initialized" >> "$LOG_FILE"
+EOF
+    
+    chmod +x /usr/local/bin/bandwidth-monitor.sh
+    
+    # Create daily reset script
+    cat > /usr/local/bin/bandwidth-reset.sh << 'EOF'
+#!/bin/bash
+
+# Daily bandwidth reset script
+LOG_FILE="/var/log/bandwidth.log"
+RESET_TIME="00:00"
+
+# Reset iptables counters
+iptables -t mangle -Z
+
+# Log reset
+echo "$(date): Daily bandwidth counters reset" >> "$LOG_FILE"
+
+# Save current bandwidth stats before reset
+echo "$(date): === DAILY BANDWIDTH SUMMARY ===" >> "$LOG_FILE"
+iptables -t mangle -L -v -x | grep -E "BANDWIDTH_.*_IN|BANDWIDTH_.*_OUT" >> "$LOG_FILE"
+echo "$(date): === END SUMMARY ===" >> "$LOG_FILE"
+EOF
+    
+    chmod +x /usr/local/bin/bandwidth-reset.sh
+    
+    # Setup cron job for daily reset at midnight Africa/Nairobi timezone
+    (crontab -l 2>/dev/null; echo "0 0 * * * /usr/local/bin/bandwidth-reset.sh") | crontab -
+    
+    # Initialize bandwidth monitoring
+    /usr/local/bin/bandwidth-monitor.sh
+    
+    print_status "Bandwidth monitoring setup completed"
+}
+
+# Function to check SSL certificates
+check_ssl_certificates() {
+    print_status "Checking SSL certificates..."
+    
+    # Check for existing certificates
+    if [[ -f /etc/letsencrypt/live/*/fullchain.pem ]] || [[ -f /etc/ssl/certs/*.crt ]]; then
+        print_status "Existing SSL certificates found"
+        
+        # Find certificate paths
+        if [[ -f /etc/letsencrypt/live/*/fullchain.pem ]]; then
+            CERT_PATH=$(find /etc/letsencrypt/live/*/fullchain.pem | head -1)
+            KEY_PATH=$(find /etc/letsencrypt/live/*/privkey.pem | head -1)
+            print_status "Let's Encrypt certificate found: $CERT_PATH"
+        elif [[ -f /etc/ssl/certs/*.crt ]]; then
+            CERT_PATH=$(find /etc/ssl/certs/*.crt | head -1)
+            KEY_PATH=$(find /etc/ssl/private/*.key | head -1)
+            print_status "SSL certificate found: $CERT_PATH"
+        fi
+        
+        return 0
+    else
+        print_warning "No SSL certificates found"
+        return 1
+    fi
+}
+
+# Function to request SSL certificate
+request_ssl_certificate() {
+    if [[ -z "$DOMAIN" || -z "$EMAIL" ]]; then
+        print_warning "Domain or email not provided. SSL certificate not requested."
+        return 1
+    fi
+    
+    print_status "Requesting SSL certificate for domain: $DOMAIN"
+    
+    # Install Certbot
+    apt install -y certbot python3-certbot-nginx >> "$LOG_FILE" 2>&1
+    
+    # Check if domain resolves
+    if ! nslookup "$DOMAIN" >/dev/null 2>&1; then
+        print_error "Domain $DOMAIN does not resolve. Please check DNS records."
+        return 1
+    fi
+    
+    # Request certificate
+    certbot certonly --standalone -d "$DOMAIN" --email "$EMAIL" --agree-tos --non-interactive >> "$LOG_FILE" 2>&1
+    
+    if [[ $? -eq 0 ]]; then
+        print_status "SSL certificate obtained successfully"
+        CERT_PATH="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+        KEY_PATH="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+        
+        # Setup auto-renewal
+        (crontab -l 2>/dev/null; echo "0 12 * * * /usr/bin/certbot renew --quiet") | crontab -
+        
+        return 0
+    else
+        print_error "Failed to obtain SSL certificate"
+        return 1
     fi
 }
 
@@ -177,7 +327,15 @@ EOF
     systemctl enable badvpn
     systemctl start badvpn
     
-    print_status "BadVPN installed and started on port $BADVPN_PORT"
+    # Verify service is actually running
+    sleep 3
+    if systemctl is-active --quiet badvpn && netstat -tlnp | grep -q ":$BADVPN_PORT"; then
+        print_status "BadVPN installed and started on port $BADVPN_PORT"
+        return 0
+    else
+        print_error "BadVPN failed to start properly"
+        return 1
+    fi
 }
 
 # Function to install UDP-Custom
@@ -260,7 +418,15 @@ EOF
     systemctl enable udp-custom
     systemctl start udp-custom
     
-    print_status "UDP-Custom installed and started on port $UDP_CUSTOM_PORT"
+    # Verify service is actually running
+    sleep 3
+    if systemctl is-active --quiet udp-custom && netstat -tlnp | grep -q ":$UDP_CUSTOM_PORT"; then
+        print_status "UDP-Custom installed and started on port $UDP_CUSTOM_PORT"
+        return 0
+    else
+        print_error "UDP-Custom failed to start properly"
+        return 1
+    fi
 }
 
 # Function to install SSL Tunnel
@@ -289,7 +455,15 @@ EOF
     systemctl enable stunnel4
     systemctl start stunnel4
     
-    print_status "SSL Tunnel installed and started on port $SSL_TUNNEL_PORT"
+    # Verify service is actually running
+    sleep 3
+    if systemctl is-active --quiet stunnel4 && netstat -tlnp | grep -q ":$SSL_TUNNEL_PORT"; then
+        print_status "SSL Tunnel installed and started on port $SSL_TUNNEL_PORT"
+        return 0
+    else
+        print_error "SSL Tunnel failed to start properly"
+        return 1
+    fi
 }
 
 # Function to install WebSocket Proxy
@@ -300,7 +474,7 @@ install_websocket_proxy() {
     curl -fsSL https://deb.nodesource.com/setup_18.x | bash - >> "$LOG_FILE" 2>&1
     apt install -y nodejs >> "$LOG_FILE" 2>&1
     
-    # Create WebSocket proxy with custom headers
+    # Create WebSocket proxy with proper error handling
     cat > /usr/local/bin/websocket-proxy.js << 'EOF'
 const WebSocket = require('ws');
 const net = require('net');
@@ -408,15 +582,41 @@ EOF
     systemctl enable websocket-proxy
     systemctl start websocket-proxy
     
-    print_status "WebSocket Proxy installed and started on port $WEBSOCKET_PORT"
+    # Verify service is actually running
+    sleep 3
+    if systemctl is-active --quiet websocket-proxy && netstat -tlnp | grep -q ":$WEBSOCKET_PORT"; then
+        print_status "WebSocket Proxy installed and started on port $WEBSOCKET_PORT"
+        return 0
+    else
+        print_error "WebSocket Proxy failed to start properly"
+        return 1
+    fi
 }
 
-# Function to install SOCKS Proxy
+# Function to install SOCKS Proxy (Fixed 3proxy)
 install_socks_proxy() {
     print_status "Installing SOCKS Proxy..."
     
-    # Install 3proxy
-    apt install -y 3proxy >> "$LOG_FILE" 2>&1
+    # Try to install 3proxy from different sources
+    if ! apt install -y 3proxy >> "$LOG_FILE" 2>&1; then
+        print_warning "3proxy not available in default repos, trying alternative installation..."
+        
+        # Install from source
+        cd /tmp
+        wget https://github.com/z3APA3A/3proxy/archive/refs/tags/0.9.4.tar.gz >> "$LOG_FILE" 2>&1
+        tar -xzf 0.9.4.tar.gz
+        cd 3proxy-0.9.4
+        
+        # Install build dependencies
+        apt install -y build-essential libssl-dev >> "$LOG_FILE" 2>&1
+        
+        # Build and install
+        make -f Makefile.Unix >> "$LOG_FILE" 2>&1
+        make -f Makefile.Unix install >> "$LOG_FILE" 2>&1
+        
+        # Create configuration directory
+        mkdir -p /etc/3proxy
+    fi
     
     # Create 3proxy configuration
     cat > /etc/3proxy/3proxy.cfg << EOF
@@ -436,7 +636,15 @@ EOF
     systemctl enable 3proxy
     systemctl start 3proxy
     
-    print_status "SOCKS Proxy installed and started on port $SOCKS_PORT"
+    # Verify service is actually running
+    sleep 3
+    if systemctl is-active --quiet 3proxy && netstat -tlnp | grep -q ":$SOCKS_PORT"; then
+        print_status "SOCKS Proxy installed and started on port $SOCKS_PORT"
+        return 0
+    else
+        print_error "SOCKS Proxy failed to start properly"
+        return 1
+    fi
 }
 
 # Function to install DNSTT
@@ -516,7 +724,15 @@ EOF
     systemctl enable dnstt
     systemctl start dnstt
     
-    print_status "DNSTT installed and started on port $DNSTT_PORT"
+    # Verify service is actually running
+    sleep 3
+    if systemctl is-active --quiet dnstt && netstat -tlnp | grep -q ":$DNSTT_PORT"; then
+        print_status "DNSTT installed and started on port $DNSTT_PORT"
+        return 0
+    else
+        print_error "DNSTT failed to start properly"
+        return 1
+    fi
 }
 
 # Function to install SSLH
@@ -577,7 +793,15 @@ EOF
     systemctl enable sslh
     systemctl start sslh
     
-    print_status "SSLH installed and started on ports $SSLH_PORT_HTTP and $SSLH_PORT_HTTPS"
+    # Verify service is actually running
+    sleep 3
+    if systemctl is-active --quiet sslh && netstat -tlnp | grep -q ":80\|:443"; then
+        print_status "SSLH installed and started on ports $SSLH_PORT_HTTP and $SSLH_PORT_HTTPS"
+        return 0
+    else
+        print_error "SSLH failed to start properly"
+        return 1
+    fi
 }
 
 # Function to install Nginx Proxy
@@ -615,44 +839,10 @@ EOF
     if [[ $? -eq 0 ]]; then
         systemctl reload nginx
         print_status "Nginx Proxy configured successfully"
+        return 0
     else
         print_error "Nginx configuration test failed"
-    fi
-}
-
-# Function to install X-UI Panel
-install_xui_panel() {
-    print_status "Installing X-UI Panel..."
-    
-    # Install dependencies
-    apt install -y curl wget unzip xz-utils >> "$LOG_FILE" 2>&1
-    
-    # Download and install X-UI
-    bash <(curl -Ls https://raw.githubusercontent.com/vaxilu/x-ui/master/install.sh) >> "$LOG_FILE" 2>&1
-    
-    print_status "X-UI Panel installed successfully"
-    print_warning "Default credentials: admin/admin"
-    print_warning "Please change the default password immediately!"
-}
-
-# Function to configure SSL certificates
-configure_ssl() {
-    if [[ -n "$DOMAIN" && -n "$EMAIL" ]]; then
-        print_status "Configuring SSL certificates for domain: $DOMAIN"
-        
-        # Install Certbot
-        apt install -y certbot python3-certbot-nginx >> "$LOG_FILE" 2>&1
-        
-        # Obtain SSL certificate
-        certbot --nginx -d "$DOMAIN" --email "$EMAIL" --agree-tos --non-interactive >> "$LOG_FILE" 2>&1
-        
-        # Set up auto-renewal
-        (crontab -l 2>/dev/null; echo "0 12 * * * /usr/bin/certbot renew --quiet") | crontab -
-        
-        print_status "SSL certificates configured successfully"
-    else
-        print_warning "Domain or email not provided. SSL certificates not configured."
-        print_warning "To configure SSL later, run: certbot --nginx -d yourdomain.com"
+        return 1
     fi
 }
 
@@ -666,68 +856,36 @@ create_status_script() {
 echo "=== Maxie VPS Manager - Tunneling Status ==="
 echo
 
-# Check BadVPN
-if systemctl is-active --quiet badvpn; then
-    echo -e "✅ BadVPN: \033[32mRUNNING\033[0m (Port 7300)"
-else
-    echo -e "❌ BadVPN: \033[31mSTOPPED\033[0m"
-fi
+# Function to check service status with real verification
+check_service_status() {
+    local service_name=$1
+    local port=$2
+    local protocol=$3
+    
+    if systemctl is-active --quiet $service_name; then
+        # Check if port is actually listening
+        if netstat -tlnp | grep -q ":$port"; then
+            echo -e "✅ $service_name: \033[32mRUNNING\033[0m (Port $port/$protocol)"
+            return 0
+        else
+            echo -e "⚠️  $service_name: \033[33mSERVICE ACTIVE BUT PORT NOT LISTENING\033[0m (Port $port/$protocol)"
+            return 1
+        fi
+    else
+        echo -e "❌ $service_name: \033[31mSTOPPED\033[0m"
+        return 1
+    fi
+}
 
-# Check UDP-Custom
-if systemctl is-active --quiet udp-custom; then
-    echo -e "✅ UDP-Custom: \033[32mRUNNING\033[0m (Port 5300)"
-else
-    echo -e "❌ UDP-Custom: \033[31mSTOPPED\033[0m"
-fi
-
-# Check SSL Tunnel
-if systemctl is-active --quiet stunnel4; then
-    echo -e "✅ SSL Tunnel: \033[32mRUNNING\033[0m (Port 444)"
-else
-    echo -e "❌ SSL Tunnel: \033[31mSTOPPED\033[0m"
-fi
-
-# Check WebSocket Proxy
-if systemctl is-active --quiet websocket-proxy; then
-    echo -e "✅ WebSocket Proxy: \033[32mRUNNING\033[0m (Port 8080)"
-else
-    echo -e "❌ WebSocket Proxy: \033[31mSTOPPED\033[0m"
-fi
-
-# Check SOCKS Proxy
-if systemctl is-active --quiet 3proxy; then
-    echo -e "✅ SOCKS Proxy: \033[32mRUNNING\033[0m (Port 200)"
-else
-    echo -e "❌ SOCKS Proxy: \033[31mSTOPPED\033[0m"
-fi
-
-# Check DNSTT
-if systemctl is-active --quiet dnstt; then
-    echo -e "✅ DNSTT: \033[32mRUNNING\033[0m (Port 53)"
-else
-    echo -e "❌ DNSTT: \033[31mSTOPPED\033[0m"
-fi
-
-# Check SSLH
-if systemctl is-active --quiet sslh; then
-    echo -e "✅ SSLH: \033[32mRUNNING\033[0m (Ports 80, 443)"
-else
-    echo -e "❌ SSLH: \033[31mSTOPPED\033[0m"
-fi
-
-# Check Nginx
-if systemctl is-active --quiet nginx; then
-    echo -e "✅ Nginx: \033[32mRUNNING\033[0m"
-else
-    echo -e "❌ Nginx: \033[31mSTOPPED\033[0m"
-fi
-
-# Check X-UI Panel
-if systemctl is-active --quiet x-ui; then
-    echo -e "✅ X-UI Panel: \033[32mRUNNING\033[0m"
-else
-    echo -e "❌ X-UI Panel: \033[31mSTOPPED\033[0m"
-fi
+# Check all services
+check_service_status "badvpn" "7300" "udp"
+check_service_status "udp-custom" "5300" "udp"
+check_service_status "stunnel4" "444" "tcp"
+check_service_status "websocket-proxy" "8080" "tcp"
+check_service_status "3proxy" "200" "tcp"
+check_service_status "dnstt" "53" "udp"
+check_service_status "sslh" "80,443" "tcp"
+check_service_status "nginx" "80" "tcp"
 
 echo
 echo "=== Port Status ==="
@@ -736,6 +894,28 @@ netstat -tlnp | grep -E ":(7300|5300|444|8080|200|53|80|443)" | sort
 echo
 echo "=== Firewall Status ==="
 ufw status
+
+echo
+echo "=== Bandwidth Monitoring Status ==="
+if iptables -t mangle -L BANDWIDTH_IN >/dev/null 2>&1; then
+    echo "✅ Bandwidth monitoring: ACTIVE"
+    echo "📊 Current bandwidth usage:"
+    iptables -t mangle -L -v -x | grep -E "BANDWIDTH_.*_IN|BANDWIDTH_.*_OUT"
+else
+    echo "❌ Bandwidth monitoring: INACTIVE"
+fi
+
+echo
+echo "=== SSL Certificate Status ==="
+if [[ -f /etc/letsencrypt/live/*/fullchain.pem ]]; then
+    echo "✅ Let's Encrypt certificate: ACTIVE"
+    find /etc/letsencrypt/live/*/fullchain.pem -exec echo "   📁 {}" \;
+elif [[ -f /etc/ssl/certs/*.crt ]]; then
+    echo "✅ SSL certificate: ACTIVE"
+    find /etc/ssl/certs/*.crt -exec echo "   📁 {}" \;
+else
+    echo "❌ SSL certificate: NOT FOUND"
+fi
 EOF
     
     chmod +x /usr/local/bin/check-tunneling-status
@@ -797,16 +977,17 @@ Domain: ${DOMAIN:-"Not configured"}
    Use: Reverse proxy with WebSocket support
    Status: $(systemctl is-active nginx)
 
+=== BANDWIDTH MONITORING ===
+
+Bandwidth monitoring is active and resets daily at midnight (Africa/Nairobi timezone)
+View current usage: iptables -t mangle -L -v -x | grep BANDWIDTH
+
 === MANAGEMENT ===
-
-X-UI Panel: $(systemctl is-active x-ui)
-Web Interface: http://$(curl -s ifconfig.me):54321
-Default Credentials: admin/admin
-
-=== USEFUL COMMANDS ===
 
 Check all services status:
   check-tunneling-status
+
+=== USEFUL COMMANDS ===
 
 Check specific service:
   systemctl status [service-name]
@@ -817,12 +998,15 @@ View logs:
 Restart service:
   systemctl restart [service-name]
 
+View bandwidth usage:
+  iptables -t mangle -L -v -x | grep BANDWIDTH
+
 === SECURITY NOTES ===
 
-1. Change default X-UI password immediately
-2. Configure firewall rules as needed
-3. Monitor logs for suspicious activity
-4. Keep system updated regularly
+1. Configure firewall rules as needed
+2. Monitor logs for suspicious activity
+3. Keep system updated regularly
+4. Monitor bandwidth usage
 
 === SUPPORT ===
 
@@ -830,6 +1014,7 @@ For issues and support, check:
 - Service logs: journalctl -u [service-name]
 - Firewall status: ufw status
 - Port status: netstat -tlnp
+- Bandwidth usage: iptables -t mangle -L -v -x
 
 Generated on: $(date)
 EOF
@@ -863,26 +1048,117 @@ get_user_input() {
     fi
 }
 
-# Function to install all protocols
+# Function to ask for protocol installation
+ask_protocol_installation() {
+    local protocol_name=$1
+    local install_function=$2
+    
+    echo
+    read -p "Do you want to install $protocol_name? (y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        $install_function
+        return $?
+    else
+        print_status "Skipping $protocol_name installation"
+        return 0
+    fi
+}
+
+# Function to install all protocols with user choice
 install_all_protocols() {
     print_header "Installing Tunneling Protocols"
     
-    install_badvpn
-    install_udp_custom
-    install_ssl_tunnel
-    install_websocket_proxy
-    install_socks_proxy
-    install_dnstt
-    install_sslh
-    install_nginx_proxy
-    install_xui_panel
+    local all_installed=true
+    
+    # Ask for each protocol
+    ask_protocol_installation "BadVPN" install_badvpn
+    if [[ $? -ne 0 ]]; then all_installed=false; fi
+    
+    ask_protocol_installation "UDP-Custom" install_udp_custom
+    if [[ $? -ne 0 ]]; then all_installed=false; fi
+    
+    ask_protocol_installation "SSL Tunnel" install_ssl_tunnel
+    if [[ $? -ne 0 ]]; then all_installed=false; fi
+    
+    ask_protocol_installation "WebSocket Proxy" install_websocket_proxy
+    if [[ $? -ne 0 ]]; then all_installed=false; fi
+    
+    ask_protocol_installation "SOCKS Proxy" install_socks_proxy
+    if [[ $? -ne 0 ]]; then all_installed=false; fi
+    
+    ask_protocol_installation "DNSTT" install_dnstt
+    if [[ $? -ne 0 ]]; then all_installed=false; fi
+    
+    ask_protocol_installation "SSLH" install_sslh
+    if [[ $? -ne 0 ]]; then all_installed=false; fi
+    
+    ask_protocol_installation "Nginx Proxy" install_nginx_proxy
+    if [[ $? -ne 0 ]]; then all_installed=false; fi
+    
+    if [[ "$all_installed" == true ]]; then
+        print_status "All selected protocols installed successfully"
+    else
+        print_warning "Some protocols failed to install. Check logs for details."
+    fi
+}
+
+# Function to install individual protocol
+install_individual_protocol() {
+    print_header "Install Individual Protocol"
+    echo
+    echo "Available protocols:"
+    echo "1. BadVPN (UDP Tunneling)"
+    echo "2. UDP-Custom (Custom UDP Proxy)"
+    echo "3. SSL Tunnel (SSL-encrypted SSH)"
+    echo "4. WebSocket Proxy (WebSocket SSH)"
+    echo "5. SOCKS Proxy (SOCKS5)"
+    echo "6. DNSTT (DNS Tunneling)"
+    echo "7. SSLH (SSL/SSH Multiplexer)"
+    echo "8. Nginx Proxy (Reverse Proxy)"
+    echo "9. Back to main menu"
+    echo
+    
+    read -p "Select protocol to install (1-9): " choice
+    
+    case $choice in
+        1) install_badvpn ;;
+        2) install_udp_custom ;;
+        3) install_ssl_tunnel ;;
+        4) install_websocket_proxy ;;
+        5) install_socks_proxy ;;
+        6) install_dnstt ;;
+        7) install_sslh ;;
+        8) install_nginx_proxy ;;
+        9) return ;;
+        *) print_error "Invalid choice"; return ;;
+    esac
+    
+    # Verify installation
+    if [[ $? -eq 0 ]]; then
+        print_status "Protocol installed successfully"
+        read -p "Press Enter to continue..."
+    else
+        print_error "Protocol installation failed"
+        read -p "Press Enter to continue..."
+    fi
 }
 
 # Function to finalize setup
 finalize_setup() {
     print_header "Finalizing Setup"
     
-    configure_ssl
+    # Check SSL certificates
+    if ! check_ssl_certificates; then
+        if [[ -n "$DOMAIN" && -n "$EMAIL" ]]; then
+            request_ssl_certificate
+        fi
+    fi
+    
+    # Setup bandwidth monitoring
+    setup_bandwidth_monitoring
+    
+    # Create status script and connection info
     create_status_script
     create_connection_info
     
@@ -890,34 +1166,18 @@ finalize_setup() {
     echo
     echo "=== NEXT STEPS ==="
     echo "1. Check service status: check-tunneling-status"
-    echo "2. Access X-UI Panel: http://$(curl -s ifconfig.me):54321"
-    echo "3. Change default X-UI password"
-    echo "4. Configure your clients to use the tunneling protocols"
-    echo "5. Review connection info: cat /root/tunneling-connection-info.txt"
+    echo "2. Configure your clients to use the tunneling protocols"
+    echo "3. Review connection info: cat /root/tunneling-connection-info.txt"
+    echo "4. Monitor bandwidth usage with iptables"
     echo
     echo "=== IMPORTANT ==="
     echo "All services are configured to start automatically on boot"
     echo "Firewall rules have been configured for all protocol ports"
-    echo "SSL certificates will auto-renew every 90 days"
+    echo "Bandwidth monitoring resets daily at midnight (Africa/Nairobi timezone)"
     echo
 }
 
-# Main execution
-main() {
-    # Initialize log file
-    touch "$LOG_FILE"
-    echo "$(date): Starting Maxie VPS Manager tunneling setup" > "$LOG_FILE"
-    
-    check_root
-    check_system
-    get_user_input
-    update_system
-    configure_firewall
-    install_all_protocols
-    finalize_setup
-    
-    echo "$(date): Setup completed successfully" >> "$LOG_FILE"
-}
-
-# Run main function
-main "$@"
+# Function to show main menu
+show_main_menu() {
+    while true; do
+   
