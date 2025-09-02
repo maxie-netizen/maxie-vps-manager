@@ -104,7 +104,7 @@ declare -A DEFAULT_PORTS=(
 # Check if port is in use
 check_port_usage() {
     local port=$1
-    local service=$(netstat -tlnp 2>/dev/null | grep ":$port " | awk '{print $7}' | cut -d'/' -f2)
+    local service=$(ss -tlnp 2>/dev/null | grep ":$port " | awk '{print $NF}' | cut -d'/' -f2)
     if [[ -n "$service" ]]; then
         echo "$service"
     else
@@ -179,6 +179,9 @@ install_protocol() {
             ;;
         "sslh-https")
             install_sslh_https "$port"
+            ;;
+        "dropbear")
+            install_dropbear "$port"
             ;;
         *)
             echo -e "${RED}❌ Unknown protocol: $protocol${NC}"
@@ -317,6 +320,58 @@ install_sslh_https() {
     echo "SSLH HTTPS installation completed"
 }
 
+install_dropbear() {
+    local port=$1
+    echo "Installing Dropbear SSH on port $port..."
+    
+    apt update
+    apt install -y dropbear
+    
+    # Configure Dropbear
+    cat > /etc/default/dropbear << EOF
+# Dropbear SSH Server Configuration
+DROPBEAR_PORT=$port
+DROPBEAR_EXTRA_ARGS="-p 2222"
+DROPBEAR_BANNER="/etc/dropbear/banner"
+DROPBEAR_RSAKEY="/etc/dropbear/dropbear_rsa_host_key"
+DROPBEAR_ECDSAKEY="/etc/dropbear/dropbear_ecdsa_host_key"
+DROPBEAR_ED25519KEY="/etc/dropbear/dropbear_ed25519_host_key"
+DROPBEAR_WINDOW_SIZE=65536
+DROPBEAR_KEEPALIVE=0
+DROPBEAR_PIDFILE="/var/run/dropbear.pid"
+DROPBEAR_LOG_LEVEL=1
+DROPBEAR_EXTRA_ARGS="-s -g -j -k"
+EOF
+    
+    # Create banner
+    mkdir -p /etc/dropbear
+    cat > /etc/dropbear/banner << EOF
+==========================================
+    MAXIE VPS MANAGER - DROPBEAR SSH
+==========================================
+Welcome to the server!
+EOF
+    
+    # Generate host keys if they don't exist
+    if [[ ! -f /etc/dropbear/dropbear_rsa_host_key ]]; then
+        dropbearkey -t rsa -f /etc/dropbear/dropbear_rsa_host_key -s 2048
+    fi
+    
+    if [[ ! -f /etc/dropbear/dropbear_ecdsa_host_key ]]; then
+        dropbearkey -t ecdsa -f /etc/dropbear/dropbear_ecdsa_host_key -s 256
+    fi
+    
+    if [[ ! -f /etc/dropbear/dropbear_ed25519_host_key ]]; then
+        dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key
+    fi
+    
+    # Start Dropbear
+    systemctl enable dropbear
+    systemctl start dropbear
+    
+    echo "Dropbear SSH installation completed"
+}
+
 # Protocol uninstallation functions
 uninstall_badvpn() {
     systemctl stop badvpn 2>/dev/null || true
@@ -357,6 +412,13 @@ uninstall_sslh() {
     apt remove -y sslh 2>/dev/null || true
 }
 
+uninstall_dropbear() {
+    systemctl stop dropbear 2>/dev/null || true
+    systemctl disable dropbear 2>/dev/null || true
+    apt remove -y dropbear 2>/dev/null || true
+    rm -rf /etc/dropbear
+}
+
 # Individual protocol management menu
 manage_individual_protocols() {
     while true; do
@@ -371,8 +433,9 @@ manage_individual_protocols() {
         echo "6. Install DNSTT"
         echo "7. Install SSLH (HTTP)"
         echo "8. Install SSLH (HTTPS)"
-        echo "9. Uninstall Protocol"
-        echo "10. Back to Main Menu"
+        echo "9. Install Dropbear SSH"
+        echo "10. Uninstall Protocol"
+        echo "11. Back to Main Menu"
         echo
         
         read -p "Choose option: " choice
@@ -419,9 +482,14 @@ manage_individual_protocols() {
                 install_protocol "sslh-https" "$port"
                 ;;
             9)
-                uninstall_protocol_menu
+                read -p "Enter port for Dropbear SSH (default: 22): " port
+                port=${port:-22}
+                install_protocol "dropbear" "$port"
                 ;;
             10)
+                uninstall_protocol_menu
+                ;;
+            11)
                 break
                 ;;
             *)
@@ -440,10 +508,11 @@ uninstall_protocol_menu() {
     echo "2. UDP-Custom"
     echo "3. SSL Tunnel"
     echo "4. WebSocket Proxy"
-    echo "5. SOCKS Proxy"
-    echo "6. DNSTT"
-    echo "7. SSLH"
-    echo "8. Back"
+            echo "5. SOCKS Proxy"
+        echo "6. DNSTT"
+        echo "7. SSLH"
+        echo "8. Dropbear SSH"
+        echo "9. Back"
     echo
     
     read -p "Choose protocol to uninstall: " choice
@@ -456,7 +525,8 @@ uninstall_protocol_menu() {
         5) uninstall_protocol "socks" ;;
         6) uninstall_protocol "dnstt" ;;
         7) uninstall_protocol "sslh" ;;
-        8) return ;;
+        8) uninstall_protocol "dropbear" ;;
+        9) return ;;
         *) echo "Invalid option" ;;
     esac
 }
@@ -469,9 +539,9 @@ print_menu() {
     echo
     echo "1. Install All Tunneling Protocols"
     echo "2. Check Service Status"
-    echo "3. Manage Individual Services"
+    echo "3. View Bandwidth Usage"
     echo "4. Individual Protocol Management"
-    echo "5. Configure SSL Certificates"
+    echo "5. SSL Certificate Management"
     echo "6. View Connection Information"
     echo "7. System Utilities"
     echo "8. User Management"
@@ -483,7 +553,7 @@ check_services() {
     echo -e "${GREEN}=== Service Status ===${NC}"
     echo
     
-    services=("badvpn" "udp-custom" "stunnel4" "websocket-proxy" "3proxy" "dnstt" "sslh" "nginx")
+    services=("badvpn" "udp-custom" "stunnel4" "websocket-proxy" "3proxy" "dnstt" "sslh" "nginx" "dropbear")
     
     for service in "${services[@]}"; do
         if systemctl is-active --quiet "$service" 2>/dev/null; then
@@ -494,79 +564,108 @@ check_services() {
     done
     
     echo
+    echo "=== Port Status ==="
+    ss -tlnp 2>/dev/null | grep -E ":(7300|5300|444|8080|200|53|80|443|8443|8081|22)" | sort | while read line; do
+        local port=$(echo "$line" | grep -o ":[0-9]*" | head -1 | cut -d: -f2)
+        local service=$(echo "$line" | awk '{print $NF}' | cut -d'/' -f2)
+        local pid=$(echo "$line" | awk '{print $NF}' | cut -d'/' -f1)
+        echo "  Port $port: $service (PID: $pid)"
+    done || echo "ss command not available"
+    
+    echo
     echo "Press Enter to continue..."
     read
 }
 
-manage_services() {
-    while true; do
-        clear
-        echo -e "${BLUE}=== Service Management ===${NC}"
-        echo
-        echo "1. Start All Services"
-        echo "2. Stop All Services"
-        echo "3. Restart All Services"
-        echo "4. Enable All Services"
-        echo "5. Back to Main Menu"
-        echo
-        
-        read -p "Choose option: " choice
-        
-        case $choice in
-            1)
-                echo "Starting all services..."
-                systemctl start badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx 2>/dev/null || true
-                ;;
-            2)
-                echo "Stopping all services..."
-                systemctl stop badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx 2>/dev/null || true
-                ;;
-            3)
-                echo "Restarting all services..."
-                systemctl restart badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx 2>/dev/null || true
-                ;;
-            4)
-                echo "Enabling all services..."
-                systemctl enable badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx 2>/dev/null || true
-                ;;
-            5)
-                break
-                ;;
-            *)
-                echo "Invalid option"
-                ;;
-        esac
-        
-        echo "Press Enter to continue..."
-        read
-    done
-}
-
-configure_ssl() {
-    echo -e "${BLUE}=== SSL Certificate Configuration ===${NC}"
+view_bandwidth_usage() {
+    echo -e "${BLUE}=== Bandwidth Usage ===${NC}"
     echo
     
-    read -p "Enter your domain name: " domain
-    read -p "Enter your email: " email
-    
-    if [[ -n "$domain" && -n "$email" ]]; then
-        echo "Installing Certbot..."
-        apt update
-        apt install -y certbot python3-certbot-nginx
-        
-        echo "Obtaining SSL certificate..."
-        certbot --nginx -d "$domain" --email "$email" --agree-tos --non-interactive
-        
-        echo "Setting up auto-renewal..."
-        (crontab -l 2>/dev/null; echo "0 12 * * * /usr/bin/certbot renew --quiet") | crontab -
-        
-        echo "SSL configuration completed!"
+    # Check if iptables rules exist
+    if ! iptables -L -n | grep -q "bandwidth_monitor"; then
+        echo -e "${YELLOW}⚠️  Bandwidth monitoring not set up. Run tunneling setup first.${NC}"
     else
-        echo "Domain and email are required for SSL configuration"
+        # Show current bandwidth usage
+        echo "User Bandwidth Usage:"
+        iptables -L OUTPUT -n -v | grep "bandwidth_monitor" | while read line; do
+            if [[ $line =~ ^[0-9]+ ]]; then
+                bytes=$(echo $line | awk '{print $1}')
+                user=$(echo $line | awk '{print $NF}')
+                if [[ $bytes -gt 0 ]]; then
+                    echo "  $user: $(numfmt --to=iec $bytes 2>/dev/null || echo "${bytes} bytes")"
+                fi
+            fi
+        done
+        
+        echo
+        echo "Daily Bandwidth Usage (resets at midnight Africa/Nairobi):"
+        if [[ -f /var/log/bandwidth_daily.log ]]; then
+            cat /var/log/bandwidth_daily.log
+        else
+            echo "  No daily data available yet"
+        fi
     fi
     
+    echo
     echo "Press Enter to continue..."
     read
+}
+
+ssl_certificate_management() {
+    while true; do
+        clear
+        echo -e "${BLUE}=== SSL Certificate Management ===${NC}"
+        echo
+        echo "1. Check SSL Certificates"
+        echo "2. Request New SSL Certificate"
+        echo "3. Delete Existing SSL Certificate"
+        echo "4. Back to main menu"
+        echo
+        
+        read -p "Select option (1-4): " choice
+        
+        case $choice in
+            1) 
+                echo "=== SSL Certificate Status ==="
+                echo
+                if [[ -f /etc/letsencrypt/live/*/fullchain.pem ]]; then
+                    cert_path=$(find /etc/letsencrypt/live/*/fullchain.pem | head -1)
+                    domain=$(basename $(dirname "$cert_path"))
+                    echo "✅ Let's Encrypt Certificate Found:"
+                    echo "  Domain: $domain"
+                    echo "  Path: $cert_path"
+                    echo "  Expires: $(openssl x509 -enddate -noout -in "$cert_path" 2>/dev/null | cut -d= -f2 || echo "Unknown")"
+                elif [[ -f /etc/ssl/certs/*.crt ]]; then
+                    cert_path=$(find /etc/ssl/certs/*.crt | head -1)
+                    echo "✅ SSL Certificate Found:"
+                    echo "  Path: $cert_path"
+                    echo "  Expires: $(openssl x509 -enddate -noout -in "$cert_path" 2>/dev/null | cut -d= -f2 || echo "Unknown")"
+                else
+                    echo "❌ No SSL certificates found"
+                fi
+                read -p "Press Enter to continue..."
+                ;;
+            2)
+                echo "To request a new SSL certificate:"
+                echo "1. Run the tunneling setup script"
+                echo "2. Select option 6 (SSL Certificate Management)"
+                echo "3. Select option 2 (Request New SSL Certificate)"
+                read -p "Press Enter to continue..."
+                ;;
+            3)
+                echo "To delete an SSL certificate:"
+                echo "1. Run the tunneling setup script"
+                echo "2. Select option 6 (SSL Certificate Management)"
+                echo "3. Select option 3 (Delete Existing SSL Certificate)"
+                read -p "Press Enter to continue..."
+                ;;
+            4) return ;;
+            *) 
+                echo "Invalid choice"
+                read -p "Press Enter to continue..."
+                ;;
+        esac
+    done
 }
 
 view_connection_info() {
@@ -585,43 +684,43 @@ while true; do
     print_menu
     read -p "Choose option: " choice
     
-    case $choice in
-        1)
-            echo "Running tunneling setup..."
-            /opt/maxie-vps-manager/maxie-tunneling-setup.sh
-            ;;
-        2)
-            check_services
-            ;;
-        3)
-            manage_services
-            ;;
-        4)
-            manage_individual_protocols
-            ;;
-        5)
-            configure_ssl
-            ;;
-        6)
-            view_connection_info
-            ;;
-        7)
-            echo "Opening System Utilities..."
-            /opt/maxie-vps-manager/system-utils.sh
-            ;;
-        8)
-            echo "Opening User Management..."
-            /opt/maxie-vps-manager/user-management.sh
-            ;;
-        9)
-            echo "Goodbye!"
-            exit 0
-            ;;
-        *)
-            echo "Invalid option. Press Enter to continue..."
-            read
-            ;;
-    esac
+            case $choice in
+            1)
+                echo "Running tunneling setup..."
+                /opt/maxie-vps-manager/maxie-tunneling-setup.sh
+                ;;
+            2)
+                check_services
+                ;;
+            3)
+                view_bandwidth_usage
+                ;;
+            4)
+                manage_individual_protocols
+                ;;
+            5)
+                ssl_certificate_management
+                ;;
+            6)
+                view_connection_info
+                ;;
+            7)
+                echo "Opening System Utilities..."
+                /opt/maxie-vps-manager/system-utils.sh
+                ;;
+            8)
+                echo "Opening User Management..."
+                /opt/maxie-vps-manager/user-management.sh
+                ;;
+            9)
+                echo "Goodbye!"
+                exit 0
+                ;;
+            *)
+                echo "Invalid option. Press Enter to continue..."
+                read
+                ;;
+        esac
 done
 EOF
 
@@ -683,14 +782,15 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "Removing Maxie VPS Manager..."
     
     # Stop and disable services
-    systemctl stop badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx 2>/dev/null || true
-    systemctl disable badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx 2>/dev/null || true
+    systemctl stop badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx dropbear 2>/dev/null || true
+    systemctl disable badvpn udp-custom stunnel4 websocket-proxy 3proxy dnstt sslh nginx dropbear 2>/dev/null || true
     
     # Remove systemd services
     rm -f /etc/systemd/system/badvpn.service
     rm -f /etc/systemd/system/udp-custom.service
     rm -f /etc/systemd/system/websocket-proxy.service
     rm -f /etc/systemd/system/dnstt.service
+    rm -f /etc/systemd/system/dropbear.service
     
     # Remove scripts
     rm -f /usr/local/bin/maxie-vps-manager
@@ -736,5 +836,7 @@ echo "- All services will start automatically on boot"
 echo "- Firewall rules will be configured automatically"
 echo "- SSL certificates will auto-renew every 90 days"
 echo "- All tunneling protocols run as systemd services for automatic startup"
+echo "- Bandwidth monitoring resets daily at midnight (Africa/Nairobi timezone)"
+echo "- Dropbear SSH provides lightweight SSH server functionality"
 echo
 echo "Installation completed at: $(date)"
